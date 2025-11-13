@@ -3,10 +3,17 @@
 
 .env
 
-data/
+
+# ignore big buckets / generated data
+data/artifacts/**
+data/raw_events/**
+data/sessions/**
 *.parquet
 *.csv
 *.jsonl
+
+# allow small demo samples
+!data/samples/**
 
 .vscode/
 .idea/
