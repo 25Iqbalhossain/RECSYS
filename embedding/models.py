@@ -1,7 +1,7 @@
 # embeddings/models.py
 from __future__ import annotations
 import numpy as np
-import hashlib
+#import hashlib
 
 DIM = 64  # keep small for demo
 """
@@ -26,13 +26,13 @@ from sentence_transformers import SentenceTransformer
 
 try:
     model = SentenceTransformer('all-MiniLM-L6-v2')
-    # মডেলের ডাইমেনশন (384) এখন DIM ভেরিয়েবলে রাখছি
+    
     DIM = model.get_sentence_embedding_dimension() 
 except Exception as e:
     print(f"Error loading SentenceTransformer model: {e}")
     print("Please run 'pip install sentence-transformers'")
     model = None
-    DIM = 0 # একটি ডিফল্ট মান
+    DIM = 0 
 
 def _hash_to_vec(text: str, dim: int = DIM) -> np.ndarray | None:
    

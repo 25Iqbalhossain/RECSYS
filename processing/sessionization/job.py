@@ -2,12 +2,13 @@
 Build sessions from raw events with a 30-minute inactivity gap.
 Input : data/raw_events/events.jsonl
 Output: data/sessions/sessions.parquet
+
 """
 from pathlib import Path
 import json
 import pandas as pd
 
-RAW = Path("data/raw_events/events.jsonl")
+RAW = Path("C:\Users\hi\recsys\data\artifacts\user_history_merged.jsonl")
 OUT = Path("data/sessions/sessions.parquet")
 OUT.parent.mkdir(parents=True, exist_ok=True)
 

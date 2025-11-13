@@ -1,6 +1,6 @@
 .venv/
-__pycache__/
-*.pyc
+
+
 .env
 
 data/
@@ -10,3 +10,4 @@ data/
 
 .vscode/
 .idea/
+.venv
