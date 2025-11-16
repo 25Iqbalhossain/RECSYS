@@ -4,6 +4,8 @@ from pydantic import BaseModel, field_validator
 from datetime import datetime
 from pathlib import Path
 import json
+import os, time, random
+import runpy
 import pandas as pd
 
 from retrieval.covis.covis_services import CoVis
@@ -14,17 +16,24 @@ import numpy as np
 from embedding.models import embed_item_id, embed_text, DIM   # <-- fixed 'embeddings'
 from retrieval.vector_store import FaissStore
 from candidate_generation.hybrid import fuse_sources
+from catalog.store import Catalog
+from ranker.simple_ltr import load_weights, score_with_weights
 
-app = FastAPI(title="Recs API (Day 1+)", version="1.3.0")
+app = FastAPI(title="Recs API (Day 1+)", version="1.4.0")
+
+# Absolute project root (repo root)
+ROOT = Path(__file__).resolve().parents[1]
 
 # ---------- Paths ----------
-RAW_DIR = Path("data/raw_events"); RAW_DIR.mkdir(parents=True, exist_ok=True)
+RAW_DIR = (ROOT / "data" / "raw_events"); RAW_DIR.mkdir(parents=True, exist_ok=True)
 EVENTS_PATH = RAW_DIR / "events.jsonl"
-SESS_PARQUET = Path("data/sessions/sessions.parquet")
+SESS_PARQUET = ROOT / "data" / "sessions" / "sessions.parquet"
 
 # ---------- State ----------
 COVIS = CoVis(path="data/artifacts/covis.parquet")
 FAISS = FaissStore()
+CATALOG = Catalog()
+RANKER = load_weights()
 
 # ---------- Models ----------
 class TrackEvent(BaseModel):
@@ -107,7 +116,8 @@ def _popular_from_covis(k: int = 20):
     try:
         df = getattr(COVIS, "df", None)
         if df is None or df.empty: return []
-        agg = df.groupby("item_id")["count"].sum().sort_values(ascending=False).head(k)
+        col = "score" if "score" in df.columns else "count"
+        agg = df.groupby("item_id")[col].sum().sort_values(ascending=False).head(k)
         return [{"item_id": str(i), "score": float(s)} for i, s in agg.items()]
     except Exception:
         return []
@@ -237,7 +247,33 @@ def _personalized_covis(user_id: str, n: int = 20, ctx_k: int = 5, alpha: float 
 # ---------- Endpoints ----------
 @app.get("/health")
 def health():
+    mode = os.environ.get("AUTO_BOOTSTRAP", "1")
+    try:
+        if mode == "2":
+            _maybe_bootstrap_demo(force=True)
+        elif mode == "1":
+            _maybe_bootstrap_demo(force=False)
+    except Exception:
+        pass
     return {"ok": True}
+
+
+# ---------- Auto-bootstrap on app startup ----------
+@app.on_event("startup")
+def _on_startup_bootstrap():
+    """Automatically (re)generate data on app start based on AUTO_BOOTSTRAP.
+    AUTO_BOOTSTRAP:
+      0 = off, 1 = only if missing (default), 2 = force regenerate
+    """
+    mode = os.environ.get("AUTO_BOOTSTRAP", "1")
+    try:
+        if mode == "2":
+            _maybe_bootstrap_demo(force=True)
+        elif mode == "1":
+            _maybe_bootstrap_demo(force=False)
+    except Exception:
+        # Don't block startup if bootstrap fails
+        pass
 
 @app.post("/track")
 def track(ev: TrackEvent):
@@ -275,6 +311,222 @@ def reload_faiss():
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.post("/reload_ranker")
+def reload_ranker():
+    try:
+        global RANKER
+        RANKER = load_weights()
+        return {"ok": RANKER is not None}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ---------- Demo bootstrap (sample data) ----------
+RAW_DIR = (ROOT / "data" / "raw_events"); RAW_DIR.mkdir(parents=True, exist_ok=True)
+CAT_DIR = (ROOT / "data" / "catalog"); CAT_DIR.mkdir(parents=True, exist_ok=True)
+ART_DIR = (ROOT / "data" / "artifacts"); ART_DIR.mkdir(parents=True, exist_ok=True)
+
+def _write_sample_catalog(n: int = 50) -> Path:
+    path_csv = CAT_DIR / "items.csv"
+    if path_csv.exists():
+        return path_csv
+    rows = []
+    now = int(time.time())
+    for i in range(1, n + 1):
+        iid = f"item_{i}"
+        title = f"Sample Item {i}"
+        desc = f"Synthetic description for item {i}."
+        created_ts = now - random.randint(0, 90) * 86400
+        rows.append({"item_id": iid, "title": title, "desc": desc, "created_ts": created_ts})
+    pd.DataFrame(rows).to_csv(path_csv, index=False)
+    return path_csv
+
+def _write_sample_events(users: int = 8, seq_min: int = 3, seq_max: int = 6) -> Path:
+    events_path = RAW_DIR / "events.jsonl"
+    if events_path.exists() and events_path.stat().st_size > 0:
+        return events_path
+    ids = CATALOG.all_ids() or [f"item_{i}" for i in range(1, 51)]
+    now = int(time.time()) - 86400
+    with open(events_path, "w", encoding="utf-8") as f:
+        for u in range(1, users + 1):
+            uid = f"U{u}"
+            t = now + random.randint(0, 3600)
+            for _ in range(random.randint(2, 5)):
+                k = random.randint(seq_min, seq_max)
+                seq = random.sample(ids, min(k, len(ids)))
+                for iid in seq:
+                    evt = {"user_id": uid, "item_id": iid, "event_type": "view", "ts": t}
+                    f.write(json.dumps(evt, ensure_ascii=False) + "\n")
+                    if random.random() < 0.3:
+                        evt2 = {"user_id": uid, "item_id": iid, "event_type": "click", "ts": t + 1}
+                        f.write(json.dumps(evt2, ensure_ascii=False) + "\n")
+                    t += random.randint(5, 60)
+                t += random.randint(300, 1800)
+    return events_path
+
+def _synthesize_events_from_merged() -> Path | None:
+    """If events.jsonl is missing but merged history exists, synthesize events with timestamps.
+    Reads data/artifacts/user_history_merged.jsonl where each line is {user_id, history: [item_ids]}.
+    Generates view/click events per user with plausible timestamps and writes data/raw_events/events.jsonl.
+    """
+    merged = ART_DIR / "user_history_merged.jsonl"
+    if EVENTS_PATH.exists() and EVENTS_PATH.stat().st_size > 0:
+        return EVENTS_PATH
+    if not merged.exists():
+        return None
+    rows = [json.loads(l) for l in merged.read_text(encoding="utf-8").splitlines() if l.strip()]
+    if not rows:
+        return None
+    base = int(time.time()) - 2 * 86400
+    with open(EVENTS_PATH, "w", encoding="utf-8") as f:
+        for rec in rows:
+            uid = str(rec.get("user_id"))
+            hist = [str(x) for x in (rec.get("history") or []) if x]
+            # assume most-recent-first; replay oldest to newest
+            seq = list(reversed(hist))
+            t = base + random.randint(0, 6*3600)
+            for item in seq:
+                evt = {"user_id": uid, "item_id": item, "event_type": "view", "ts": t}
+                f.write(json.dumps(evt, ensure_ascii=False) + "\n")
+                if random.random() < 0.25:
+                    evt2 = {"user_id": uid, "item_id": item, "event_type": "click", "ts": t + 1}
+                    f.write(json.dumps(evt2, ensure_ascii=False) + "\n")
+                t += random.randint(5, 90)
+            base += random.randint(600, 3600)
+    return EVENTS_PATH
+
+def _run_pipeline_once() -> dict:
+    # optional sample generators: external history + merge
+    try:
+        if not ((RAW_DIR / "user_history_external.jsonl").exists()):
+            runpy.run_path("data/samples/history_dumy_data.py", run_name="__main__")
+        runpy.run_path(str(ROOT / "data" / "samples" / "marge_events_and_histroy.py"), run_name="__main__")
+    except Exception:
+        # continue if samples not present
+        pass
+    try:
+        from processing.sessionization import job as sess_job
+        # ensure we have events; if missing but merged history exists, synthesize
+        if not EVENTS_PATH.exists():
+            _synthesize_events_from_merged()
+        sess_job.run()
+    except Exception as e:
+        return {"ok": False, "step": "sessionize", "error": str(e)}
+    try:
+        import scripts.build_covis as bc
+        bc.build_assoc(topk=100)
+    except Exception as e:
+        return {"ok": False, "step": "build_covis", "error": str(e)}
+    try:
+        import scripts.backfill_embeddings as be
+        be.main()
+    except Exception as e:
+        return {"ok": False, "step": "backfill_embeddings", "error": str(e)}
+    try:
+        import scripts.build_faiss as bf
+        bf.main()
+    except Exception as e:
+        return {"ok": False, "step": "build_faiss", "error": str(e)}
+    # train simple reranker (optional)
+    try:
+        import ranker.train_simple as ts
+        ts.main()
+    except Exception:
+        # continue even if training fails (e.g., small data)
+        pass
+    # reload artifacts
+    try:
+        COVIS.reload(); FAISS.reload()
+        global RANKER
+        RANKER = load_weights()
+    except Exception:
+        pass
+    return {"ok": True}
+
+def _clear_paths(paths: list[Path]) -> None:
+    for p in paths:
+        try:
+            if p.exists():
+                p.unlink()
+        except Exception:
+            pass
+
+def _maybe_bootstrap_demo(force: bool = False) -> dict:
+    if force:
+        _clear_paths([
+            RAW_DIR / "events.jsonl",
+            (ROOT / "data" / "sessions" / "sessions.parquet"),
+            ART_DIR / "covis.parquet",
+            ART_DIR / "item_embeddings.parquet",
+            ART_DIR / "faiss.index",
+            ART_DIR / "faiss_ids.parquet",
+            (ART_DIR / "ranker_weights.json"),
+        ])
+    needed = [
+        (CAT_DIR / "items.csv").exists(),
+        (RAW_DIR / "events.jsonl").exists(),
+        Path("data/sessions/sessions.parquet").exists(),
+        (ART_DIR / "covis.parquet").exists(),
+        (ART_DIR / "item_embeddings.parquet").exists(),
+        (ART_DIR / "faiss.index").exists(),
+    ]
+    if all(needed) and not force:
+        return {"ok": True, "skipped": True}
+    _write_sample_catalog(); CATALOG.reload(); _write_sample_events()
+    return _run_pipeline_once()
+
+@app.post("/bootstrap_demo")
+def bootstrap_demo(force: bool = False):
+    try:
+        return _maybe_bootstrap_demo(force=force)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/generate/events")
+def generate_events(source: str = "synthetic"):
+    """Generate data/raw_events/events.jsonl on demand.
+    - source=synthetic: writes random sessions using catalog item_ids
+    - source=merged: synthesize events from data/artifacts/user_history_merged.jsonl if present
+    Returns file path and approximate line count.
+    """
+    try:
+        if source == "merged":
+            p = _synthesize_events_from_merged()
+            mode = "merged"
+        else:
+            p = _write_sample_events()
+            mode = "synthetic"
+        if not p or not p.exists():
+            raise HTTPException(status_code=500, detail="Could not generate events.jsonl")
+        # count lines
+        try:
+            n = sum(1 for _ in open(p, "r", encoding="utf-8"))
+        except Exception:
+            n = None
+        return {"ok": True, "mode": mode, "path": str(p), "lines": n}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/debug/paths")
+def debug_paths():
+    return {
+        "root": str(ROOT),
+        "raw_dir": str(RAW_DIR),
+        "events_path": str(EVENTS_PATH),
+        "sessions_path": str(SESS_PARQUET),
+        "artifacts_dir": str(ART_DIR),
+        "catalog_dir": str(CAT_DIR),
+        "exists": {
+            "events": EVENTS_PATH.exists(),
+            "sessions": SESS_PARQUET.exists(),
+            "covis": (ART_DIR / "covis.parquet").exists(),
+            "embeddings": (ART_DIR / "item_embeddings.parquet").exists(),
+            "faiss_index": (ART_DIR / "faiss.index").exists(),
+            "faiss_ids": (ART_DIR / "faiss_ids.parquet").exists(),
+            "ranker_weights": (ART_DIR / "ranker_weights.json").exists(),
+        },
+    }
 # ---- Status / Readiness ----
 @app.get("/status/ann")
 def status_ann(context_item_id: str | None = None, user_id: str | None = None, debug: bool = False, n: int = 5):
@@ -514,6 +766,112 @@ def recs_semantic(context_item_id: str = Query(...), n: int = 20, strict_ann: bo
     ranked = rank_simple(candidates, n=n)
     ranked = _annotate_semantic(ranked, embed_item_id(context_item_id))
     return {"mode": "covis_fallback", "context_item_id": context_item_id, "results": ranked}
+
+# ---- Ranked Recs (LTR) ----
+def _features_for_candidate(context_vec: np.ndarray | None, context_item_id: str | None, item_id: str) -> dict:
+    f_sem = 0.0
+    if context_vec is not None:
+        vi = embed_item_id(item_id)
+        if vi is not None:
+            vq = context_vec.astype(np.float32)
+            vi = vi.astype(np.float32)
+            nq = np.linalg.norm(vq) or 1.0
+            ni = np.linalg.norm(vi) or 1.0
+            f_sem = float(np.dot(vq / nq, vi / ni))
+    f_cov = 0.0
+    if context_item_id:
+        try:
+            nbrs = {r["item_id"]: r["score"] for r in COVIS.topk_for_item(context_item_id, k=200)}
+            f_cov = float(nbrs.get(str(item_id), 0.0))
+        except Exception:
+            pass
+    f_pop = 0.0
+    try:
+        dfc = getattr(COVIS, "df", None)
+        if dfc is not None and not dfc.empty:
+            f_pop = float(dfc[dfc["neighbor"].astype(str) == str(item_id)]["count"].sum())
+    except Exception:
+        pass
+    f_fresh = 0.0
+    it = CATALOG.get(item_id) if CATALOG else None
+    if it and it.created_ts:
+        import math, time
+        age_days = max(0.0, (time.time() - float(it.created_ts)) / 86400.0)
+        f_fresh = math.exp(-age_days / 30.0)
+    return {"semantic": f_sem, "covis": f_cov, "popularity": f_pop, "freshness": f_fresh}
+
+def _apply_mmr(items: list[dict], lambda_mult: float = 0.8, k: int = 20) -> list[dict]:
+    if not items:
+        return items
+    selected = []
+    candidates = items[:]
+    sims = {}
+    def sim(a: dict, b: dict) -> float:
+        key = (a["item_id"], b["item_id"]) if a["item_id"] <= b["item_id"] else (b["item_id"], a["item_id"])
+        if key in sims:
+            return sims[key]
+        va = embed_item_id(a["item_id"]) or None
+        vb = embed_item_id(b["item_id"]) or None
+        if va is None or vb is None:
+            s = 0.0
+        else:
+            va = va.astype(np.float32); vb = vb.astype(np.float32)
+            na = np.linalg.norm(va) or 1.0; nb = np.linalg.norm(vb) or 1.0
+            s = float(np.dot(va/na, vb/nb))
+        sims[key] = s
+        return s
+    while candidates and len(selected) < k:
+        best = None
+        best_score = -1e9
+        for c in candidates:
+            rel = float(c.get("rerank_score") or c.get("score") or 0.0)
+            div = 0.0 if not selected else max(sim(c, s) for s in selected)
+            mmr = lambda_mult * rel - (1 - lambda_mult) * div
+            if mmr > best_score:
+                best_score = mmr
+                best = c
+        selected.append(best)
+        candidates.remove(best)
+    return selected
+
+@app.get("/recs/ranked")
+def recs_ranked(context_item_id: str | None = None, user_id: str | None = None, n: int = 20,
+                diversity: str | None = None, mmr_lambda: float = 0.8, freshness_boost: bool = False,
+                strict_ann: bool = False):
+    n = max(1, min(n, 100))
+    if not context_item_id and user_id:
+        context_item_id = _last_item_for_user(user_id)
+    ann = _ann_from_item(context_item_id, n=5*n) if context_item_id else []
+    used_fallback = False
+    if not ann:
+        if strict_ann:
+            raise HTTPException(status_code=503, detail="ANN unavailable; strict_ann=true prevents fallback")
+        used_fallback = True
+        cov = COVIS.topk_for_item(context_item_id, k=max(5*n, 50)) if context_item_id else _popular_from_covis(k=5*n)
+        ann = rank_simple(cov, n=5*n)
+    vq = embed_item_id(context_item_id) if context_item_id else None
+    feat_names_weights = RANKER
+    out = []
+    for r in ann:
+        iid = str(r.get("item_id"))
+        feats = _features_for_candidate(vq, context_item_id, iid)
+        base = float(r.get("score", 0.0))
+        if freshness_boost:
+            base += 0.05 * feats.get("freshness", 0.0)
+        rerank = base
+        if feat_names_weights:
+            names, w, b = feat_names_weights
+            rerank = score_with_weights(feats, names, w, b)
+        out.append({"item_id": iid, "score": base, "semantic_score": feats.get("semantic"), "rerank_score": rerank})
+    if diversity == "mmr":
+        out = _apply_mmr(out, lambda_mult=mmr_lambda, k=n)
+    out = out[:n]
+    return {
+        "mode": "ranked_ann" if not used_fallback else "ranked_covis_fallback",
+        "context_item_id": context_item_id,
+        "results": out,
+        "flags": {"diversity": diversity, "mmr_lambda": mmr_lambda, "freshness_boost": freshness_boost},
+    }
 
 @app.get("/recs/hybrid")
 def recs_hybrid(context_item_id: str = Query(...), n: int = 20):

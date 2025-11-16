@@ -29,25 +29,39 @@ class CoVis:
         return None
 
     def reload(self) -> None:
-        """(Re)load table and build an in-memory index by item_id."""
+        """(Re)load table and build an in-memory index by item_id.
+        If an association-rule 'score' column is present, prefer it for ranking; otherwise fall back to 'count'.
+        """
         self.df = self._read_any()
         if self.df is None or self.df.empty:
             self._index = {}
             return
         self.df["item_id"] = self.df["item_id"].astype(str)
         self.df["neighbor"] = self.df["neighbor"].astype(str)
-        self.df["count"] = self.df["count"].astype(float)
+        # numeric columns
+        if "count" in self.df.columns:
+            self.df["count"] = self.df["count"].astype(float)
+        else:
+            self.df["count"] = 0.0
+        if "score" in self.df.columns:
+            self.df["score"] = self.df["score"].astype(float)
+            order_col = "score"
+        else:
+            self.df["score"] = self.df["count"].astype(float)
+            order_col = "count"
         self._index = {
-            k: g[["neighbor", "count"]].sort_values("count", ascending=False).reset_index(drop=True)
+            k: g[["neighbor", "score", "count"]].sort_values(order_col, ascending=False).reset_index(drop=True)
             for k, g in self.df.groupby("item_id", sort=False)
         }
 
     def topk_for_item(self, item_id: str, k: int = 20) -> List[Dict[str, Any]]:
-        """Return [{'item_id': neighbor, 'score': count}, ...]"""
+        """Return [{'item_id': neighbor, 'score': score}, ...]
+        score prefers association-rule 'score' if present; else 'count'.
+        """
         if not self._index:
             return []
         key = str(item_id)
         if key not in self._index:
             return []
         df = self._index[key].head(k)
-        return [{"item_id": n, "score": float(c)} for n, c in zip(df["neighbor"], df["count"])]
+        return [{"item_id": n, "score": float(s)} for n, s in zip(df["neighbor"], df["score"])]

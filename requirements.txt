@@ -21,10 +21,9 @@ requests>=2.32,<3
 # ---- Testing ----
 pytest>=8.0,<9
 
-# ---- Embeddings (HF) [optional] ----
-# sentence-transformers>=2.7
-# torch>=2.2 ; sys_platform != "win32" or platform_machine == "AMD64"
-# NOTE: On Windows, install torch using the command from pytorch.org if pip fails.
+# ---- Embeddings (HF) ----
+sentence-transformers>=2.7
+# torch: install per-platform from pytorch.org if pip fails on Windows
 
 # ---- Learning-to-Rank (later) ----
 # scikit-learn>=1.4

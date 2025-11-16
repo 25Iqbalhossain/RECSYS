@@ -1,6 +1,4 @@
 .venv/
-
-
 .env
 
 
@@ -18,3 +16,5 @@ data/sessions/**
 .vscode/
 .idea/
 .venv
+
+embeddings/models.py

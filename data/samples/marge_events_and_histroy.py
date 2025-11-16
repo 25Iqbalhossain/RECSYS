@@ -12,12 +12,14 @@ Outputs (under data/artifacts/):
 
 from pathlib import Path
 import json
+import runpy
 import pandas as pd
 
 RAW_EVENTS = Path("data/raw_events/events.jsonl")
 EXT_CANDIDATES = [
-    Path("data/samples/generate.py"), 
+    Path("data/samples/generate.py"),
     Path("data/samples/user_history_external.jsonl"),
+    Path("data/raw_events/user_history_external.jsonl"),
 ]
 
 
@@ -58,6 +60,16 @@ def _load_events_history() -> dict[str, list[str]]:
 def _find_external_history() -> Path | None:
     for p in EXT_CANDIDATES:
         if p.exists():
+            # if it's a generator script, run it then look for the raw_events output
+            if p.suffix == ".py":
+                try:
+                    runpy.run_path(str(p), run_name="__main__")
+                except Exception:
+                    pass
+                out = Path("data/raw_events/user_history_external.jsonl")
+                if out.exists():
+                    return out
+                continue
             return p
     return None
 
