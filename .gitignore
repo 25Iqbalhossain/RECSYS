@@ -1,5 +1,17 @@
 .venv/
+__pycache__/
+*.pyc
+.env
 
+data/
+*.parquet
+*.csv
+*.jsonl
+
+.vscode/
+.idea/
+
+.venv/
 .env
 
 
@@ -7,18 +19,10 @@
 data/artifacts/**
 data/raw_events/**
 data/sessions/**
-=======
-__pycache__/
-*.pyc
-.env
-
-data/
->>>>>>> 4b9b65c8 (chore: ignore venv/data/artifacts;)
 *.parquet
 *.csv
 *.jsonl
 
-<<<<<<< HEAD
 # allow small demo samples
 !data/samples/**
 
@@ -27,7 +31,3 @@ data/
 .venv
 
 embeddings/models.py
-=======
-.vscode/
-.idea/
->>>>>>> 4b9b65c8 (chore: ignore venv/data/artifacts;)
