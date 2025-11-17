@@ -1,56 +1,47 @@
 # embeddings/models.py
 from __future__ import annotations
-import numpy as np
-#import hashlib
 
-DIM = 64  # keep small for demo
-"""
-def _hash_to_vec(text: str, dim: int = DIM) -> np.ndarray:
-    h = hashlib.sha256(text.encode("utf-8")).digest()
-    # repeat the 32-byte hash to fill dim
-    arr = np.frombuffer((h * ((dim // 32) + 1))[:dim], dtype=np.uint8).astype(np.float32)
-    v = arr - arr.mean()
-    n = np.linalg.norm(v) + 1e-9
-    return v / n
+import numpy as np
+
+# HF embedding client এবং dimension আসছে data/testconfig থেকে
+# সেখানেই .env লোড, HF token, InferenceClient সব সেট করা আছে
+from data.testconfig import hf_embed_one, EMBEDDING_DIM
+
+# Public constant: embedding vector dimension
+DIM = EMBEDDING_DIM
+
 
 def embed_text(text: str) -> np.ndarray:
+    """
+    Main public API: টেক্সট থেকে embedding বের করে।
+    আগে যেখানে SentenceTransformer ব্যবহার করতে, সেখানেই এটা ব্যবহার করবে।
 
-    return _hash_to_vec(text, DIM)
+    Parameters
+    ----------
+    text : str
+        যেকোনো ইনপুট টেক্সট / description
+
+    Returns
+    -------
+    np.ndarray
+        1D embedding vector, shape: [DIM]
+    """
+    return hf_embed_one(text)
+
 
 def embed_item_id(item_id: str) -> np.ndarray:
-   
-    return _hash_to_vec(f"ITEM::{item_id}", DIM)
-"""
-from sentence_transformers import SentenceTransformer
+    """
+    শুধু item_id থাকলে stable pseudo-embedding বানাতে চাইলে।
+    (Same item_id সবসময় একই embedding পাবে, কারণ একই string পাঠাচ্ছি.)
 
+    Parameters
+    ----------
+    item_id : str
+        ডাটাবেজে থাকা আইটেমের আইডি (যেমন "123", "movie_42")
 
-try:
-    model = SentenceTransformer('all-MiniLM-L6-v2')
-    
-    DIM = model.get_sentence_embedding_dimension() 
-except Exception as e:
-    print(f"Error loading SentenceTransformer model: {e}")
-    print("Please run 'pip install sentence-transformers'")
-    model = None
-    DIM = 0 
-
-def _hash_to_vec(text: str, dim: int = DIM) -> np.ndarray | None:
-   
-    if model is None:
-        print("Model is not loaded. Cannot create embedding.")
-        return None
-
-    embedding = model.encode(text)
-    return embedding
-
-def embed_text(text: str) -> np.ndarray | None:
-    """Deterministic embedding for demo (no heavy model)."""
-  
-    return _hash_to_vec(text, DIM)
-
-def embed_item_id(item_id: str) -> np.ndarray | None:
-    """If you only have item IDs, this gives a stable pseudo-embedding."""
-   
-    return _hash_to_vec(f"ITEM::{item_id}", DIM)
-
-
+    Returns
+    -------
+    np.ndarray
+        1D embedding vector, shape: [DIM]
+    """
+    return hf_embed_one(f"ITEM::{item_id}")

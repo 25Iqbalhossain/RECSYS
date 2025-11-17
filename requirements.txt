@@ -31,3 +31,4 @@ sentence-transformers>=2.7
 
 # ---- ONNX serving (for ranker v1) ----
 # onnxruntime>=1.18
+mysql-connector-python
