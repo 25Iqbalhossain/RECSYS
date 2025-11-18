@@ -1,4 +1,12 @@
-# index/metadata_store.py
+"""Utilities for writing FAISS metadata in JSON Lines format.
+
+Each line in the metadata file corresponds to one vector in the FAISS
+index and contains:
+
+* ``row_id`` – primary key from the source table.
+* ``text`` – the text that was embedded (or a synthesized fallback).
+* ``extra`` – optional structured metadata (title, type, language, …).
+"""
 
 import json
 from typing import Any, Dict, Optional, TextIO
@@ -6,13 +14,18 @@ from typing import Any, Dict, Optional, TextIO
 
 def _build_text_from_extra(extra: Dict[str, Any]) -> str:
     """
-    extra ডিকশনারি থেকে human-readable একটা description বানানোর চেষ্টা করি।
-    মূলত fallback হিসেবে ব্যবহার হবে, যদি text খালি থাকে।
+    Build a human‑readable fallback ``text`` field from ``extra``.
+
+    When the main ``text`` is empty or missing, we still want every
+    vector to have some description for debugging and search UI. This
+    helper stitches together a short phrase using common keys like
+    ``title``, ``type``, ``language``, ``release_year`` and
+    ``category_id``.
     """
     if not extra:
         return ""
 
-    parts = []
+    parts: list[str] = []
 
     title = extra.get("title")
     if title:
@@ -20,21 +33,20 @@ def _build_text_from_extra(extra: Dict[str, Any]) -> str:
 
     ctype = extra.get("type")
     if ctype:
-        parts.append(f"কনটেন্ট টাইপ: {ctype}")
+        parts.append(f"Type: {ctype}")
 
     lang = extra.get("language")
     if lang:
-        parts.append(f"ভাষা: {lang}")
+        parts.append(f"Language: {lang}")
 
     year = extra.get("release_year")
     if year not in (None, ""):
-        parts.append(f"রিলিজ বছর: {year}")
+        parts.append(f"Release year: {year}")
 
     category_id = extra.get("category_id")
     if category_id not in (None, ""):
-        parts.append(f"ক্যাটাগরি আইডি: {category_id}")
+        parts.append(f"Category ID: {category_id}")
 
-    # সব মিলিয়ে জোড়া লাগাই
     return " . ".join(parts) if parts else ""
 
 
@@ -45,12 +57,21 @@ def write_metadata_line(
     extra: Optional[Dict[str, Any]] = None,
 ) -> None:
     """
-    একটা record metadata ফাইলে এক লাইনে JSON হিসাবে লেখে।
-    JSON Lines format (প্রতিটা লাইনে একটা JSON object)।
+    Write a single metadata record to a JSON Lines file.
+
+    The resulting line has the shape::
+
+        {
+          "row_id": ...,
+          "text": "...",
+          "extra": { ... }
+        }
+
+    If ``text`` is blank or whitespace‑only, a fallback description is
+    generated from ``extra`` via :func:`_build_text_from_extra`.
     """
     extra = extra or {}
 
-    # যদি text ফাঁকা বা whitespace হয়, চেষ্টা করি extra থেকে একটা description বানাতে
     if not text or not text.strip():
         auto_text = _build_text_from_extra(extra)
         if auto_text:
@@ -62,5 +83,7 @@ def write_metadata_line(
         "extra": extra,
     }
 
-    # default=str => যেগুলো JSON জানে না (datetime, Decimal etc.) সেগুলো string এ convert হবে
+    # ``default=str`` ensures non‑JSON‑native types (datetime, Decimal,
+    # etc.) are converted to strings instead of raising an error.
     f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+

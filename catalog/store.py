@@ -69,4 +69,3 @@ class Catalog:
 
     def all_ids(self) -> list[str]:
         return list(self._map.keys())
-
