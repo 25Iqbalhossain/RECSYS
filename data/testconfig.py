@@ -23,20 +23,22 @@ print(f"[DEBUG] loading .env from: {env_path}  exists={env_path.exists()}")
 load_dotenv(env_path)
 
 # ==============================
-# MySQL config
+# MySQL config (loaded from .env)
 # ==============================
 
 MYSQL_CONFIG = {
-    "host": "localhost",
-    "port": 3306,
-    "user": "root",
-    "password": "",
-    "database": "bangla_reco_large",
+    # For security, all connection details are loaded from the
+    # .env file in the data/ directory (see `env_path` above).
+    "host": os.getenv("MYSQL_HOST", "localhost"),
+    "port": int(os.getenv("MYSQL_PORT", "3306")),
+    "user": os.getenv("MYSQL_USER", "root"),
+    "password": os.getenv("MYSQL_PASSWORD", ""),
+    "database": os.getenv("MYSQL_DATABASE", "bangla_reco_large"),
 }
 
-TABLE_NAME = "contents"
+TABLE_NAME = os.getenv("MYSQL_TABLE", "contents")
 TEXT_COLUMNS = ["name", "age", "gender", "city", "favorite_type"]
-BATCH_SIZE = 500
+BATCH_SIZE = int(os.getenv("MYSQL_BATCH_SIZE", "500"))
 
 # ==============================
 # Hugging Face Inference (REMOTE, with local fallback)
