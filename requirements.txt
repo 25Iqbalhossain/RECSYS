@@ -6,29 +6,32 @@ python-dotenv>=1.0
 pyyaml>=6.0
 
 # ---- Data / Batch ----
+numpy>=1.26,<3
 pandas>=2.2,<3
 pyarrow>=16.0,<18
-numpy>=1.26,<3
 
 # ---- Storage / Vector Search ----
-pymongo>=4.8,<5
-faiss-cpu>=1.8.0   # used by retrieval/vector_store.py
+faiss-cpu>=1.8.0      # provides `faiss` (retrieval/vector_store.py, index/*)
+pymongo>=4.8,<5       # reserved for optional MongoDB-backed catalog
 
 # ---- Scheduling / HTTP utils ----
 apscheduler>=3.10,<4
 requests>=2.32,<3
 
-# ---- Testing ----
-pytest>=8.0,<9
+# ---- Database (MySQL) ----
+mysql-connector-python>=8.0,<9
 
-# ---- Embeddings (HF) ----
+# ---- Embeddings / Hugging Face ----
+huggingface-hub>=0.24,<1
 sentence-transformers>=2.7
 # torch: install per-platform from pytorch.org if pip fails on Windows
 
-# ---- Learning-to-Rank (later) ----
+# ---- Testing ----
+pytest>=8.0,<9
+
+# ---- Learning-to-Rank (optional, future) ----
 # scikit-learn>=1.4
 # lightgbm>=4.3     # may require VS Build Tools on Windows
 
-# ---- ONNX serving (for ranker v1) ----
+# ---- ONNX serving (optional, future) ----
 # onnxruntime>=1.18
-mysql-connector-python
