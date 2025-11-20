@@ -13,38 +13,42 @@ os.makedirs(os.path.dirname(METADATA_PATH), exist_ok=True)
 
 def row_to_text(row: dict) -> str:
     """
-    contents টেবিলের একেকটা row থেকে একটা সুন্দর টেক্সট বানাচ্ছি,
-    যেটা embedding-এর জন্যও ব্যবহার করব আর metadata 'text' ফিল্ডেও লিখব।
+    Turn an nsp_service row into a single text string for embedding.
+    Priority: name + keyword, then other descriptive fields.
     """
-
-    # ধরে নিচ্ছি row-তেই এই ফিল্ডগুলো আছে; না থাকলে .get ব্যবহার করো
-    title = row.get("title") or ""
-    ctype = row.get("type") or ""
-    lang = row.get("language") or ""
-    year = row.get("release_year") or ""
-    category_id = row.get("category_id")
-
     parts = []
 
-    if title:
-        parts.append(str(title))
+    name = row.get("name")
+    if name:
+        parts.append(str(name))
 
+    keyword = row.get("keyword")
+    if keyword:
+        parts.append(str(keyword))
+
+    name_en = row.get("name_en")
+    if name_en:
+        parts.append(str(name_en))
+
+    provider = row.get("provider_office_name")
+    if provider:
+        parts.append(str(provider))
+
+    place = row.get("place")
+    if place:
+        parts.append(str(place))
+
+    ctype = row.get("type")
     if ctype:
-        parts.append(f"কনটেন্ট টাইপ: {ctype}")
+        parts.append(f"ধরন: {ctype}")
 
-    if lang:
-        parts.append(f"ভাষা: {lang}")
+    sector = row.get("sector")
+    if sector:
+        parts.append(f"খাত: {sector}")
 
-    if year:
-        parts.append(f"রিলিজ বছর: {year}")
-
-    if category_id is not None:
-        parts.append(f"ক্যাটাগরি আইডি: {category_id}")
-
-    # সব মিলিয়ে এক লাইনের description
+    # Fallback if everything else is empty
     if not parts:
-        # fallback, সবই ফাঁকা থাকলে
-        return f"কনটেন্ট আইডি {row.get('id', '')}"
+        return str(row.get("id", ""))
 
     return " . ".join(parts)
 

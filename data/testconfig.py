@@ -36,8 +36,20 @@ MYSQL_CONFIG = {
     "database": os.getenv("MYSQL_DATABASE", "bangla_reco_large"),
 }
 
-TABLE_NAME = os.getenv("MYSQL_TABLE", "contents")
-TEXT_COLUMNS = ["name", "age", "gender", "city", "favorite_type"]
+# nsp_service টেবিল ব্যবহার করব embeddings এর জন্য
+TABLE_NAME = os.getenv("MYSQL_TABLE", "nsp_service")
+
+# টেক্সট/description ধরনের কলামগুলো যেগুলো থেকে embedding বানাবে
+TEXT_COLUMNS = [
+    "name",                 # মূল সার্ভিস নাম (Bangla)
+    "name_en",              # ইংরেজি নাম (থাকলে)
+    "provider_office_name", # অফিস/প্রোভাইডার নাম
+    "place",                # place/অবস্থান টেক্সট
+    "type",                 # টাইপ (tinytext)
+    "sector",               # সেক্টর
+    "keyword",              # keyword ফিল্ড
+]
+
 BATCH_SIZE = int(os.getenv("MYSQL_BATCH_SIZE", "500"))
 
 # ==============================

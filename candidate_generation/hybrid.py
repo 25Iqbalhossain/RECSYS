@@ -19,7 +19,7 @@ def fuse_sources(
         scores[iid] = scores.get(iid, 0.0) + w_covis * s
     for r in ann:
         iid, s = str(r["item_id"]), float(r.get("score", 0.0))
-        scores[iid] = scores.get(iid, 0.0) + w_ann * s
+        scores[iid] = scores.get(iid, 0.0) + w_ann * s 
     if seq_boost:
         # exponential small boost for items that also appear in the user's short history
         for rank, iid in enumerate(seq_boost):
