@@ -1,0 +1,4 @@
+lancedb
+openai
+pydantic
+txtai
