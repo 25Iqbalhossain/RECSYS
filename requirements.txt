@@ -2,3 +2,6 @@ lancedb
 openai
 pydantic
 txtai
+mysql-connector-python
+pandas
+json
