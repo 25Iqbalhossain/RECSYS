@@ -7,7 +7,7 @@ import streamlit as st
 from lancedb.pydantic import LanceModel, Vector
 from pydantic import Field
 
-# ---------- Embedding client ----------
+
 
 client = openai.OpenAI(base_url="http://localhost:1234/v1", api_key="not-needed")
 
@@ -17,7 +17,7 @@ def get_embedding(text: str, prefix: str = "search_query: "):
     return response.data[0].embedding[:256]
 
 
-# ---------- LanceDB setup ----------
+
 
 db_path = "./lancedb"
 db = lancedb.connect(db_path)
@@ -36,7 +36,7 @@ else:
     table = db.open_table(table_name)
 
 
-# ---------- Metadata loader (Bangla/English names) ----------
+
 
 @st.cache_data
 def load_service_metadata(path: str = "mygov_data.json"):
@@ -60,8 +60,6 @@ def load_service_metadata(path: str = "mygov_data.json"):
 
 service_meta = load_service_metadata()
 
-
-# ---------- Documents loader for lexical model & search ----------
 
 @st.cache_data
 def load_search_documents(path: str = "mygov_data.json"):
@@ -98,9 +96,6 @@ def load_search_documents(path: str = "mygov_data.json"):
         pass
     return docs
 
-
-# ---------- Lexical models: prefix + bigram (Bangla & English) ----------
-
 def build_lexical_models(
     docs, max_prefix_len: int = 1, max_per_prefix: int = 10
 ):
@@ -125,22 +120,22 @@ def build_lexical_models(
         bn_phrase = (d["bn"] or "").strip()
         en_phrase = (d["en"] or "").strip()
 
-        # Bangla side
+        
         if bn_phrase:
             all_bn.add(bn_phrase)
             phrase = bn_phrase.lower()
             words = phrase.split()
 
-            # prefix শুধু প্রথম শব্দ পর্যন্ত (max_prefix_len=1)
+         
             for i in range(1, min(len(words), max_prefix_len) + 1):
                 prefix = " ".join(words[:i])
                 prefix_map_bn[prefix][bn_phrase] += 1
 
-            # bigram (word→next_word)
+           
             for w1, w2 in zip(words, words[1:]):
                 bigram_bn[w1][w2] += 1
 
-        # English side
+      
         if en_phrase:
             all_en.add(en_phrase)
             phrase_en = en_phrase.lower()
@@ -163,7 +158,7 @@ def build_lexical_models(
         phrases = [p for p, _ in counter.most_common(max_per_prefix)]
         prefix_en[prefix] = phrases
 
-    # bigram → sorted next-word lists
+   
     next_bn: dict[str, list[str]] = {}
     for w1, counter in bigram_bn.items():
         next_bn[w1] = [w2 for w2, _ in counter.most_common()]
@@ -183,17 +178,11 @@ def get_lexical_data(path: str = "mygov_data.json"):
     docs = load_search_documents(path)
     return build_lexical_models(docs)
 
-
-# ---------- Language detection helper ----------
-
 def is_bangla(text: str) -> bool:
     for ch in text:
         if "\u0980" <= ch <= "\u09FF":
             return True
     return False
-
-
-# ---------- Suggestion function (word-by-word) ----------
 
 def suggest_queries(
     query: str,
@@ -205,11 +194,6 @@ def suggest_queries(
     next_en: dict[str, list[str]],
     max_suggestions: int = 5,
 ) -> list[str]:
-    """
-    - আগে bigram দিয়ে word-by-word extension:
-        "আর্থিক" -> "আর্থিক ক্ষমতা", "আর্থিক সহায়তা", ...
-    - কিছু না পেলে prefix + substring fallback
-    """
     q_raw = query.strip()
     if not q_raw:
         return []
@@ -226,19 +210,19 @@ def suggest_queries(
 
     words = q.split()
 
-    # 1) bigram-based: last word -> next words
+   
     if words:
         last = words[-1]
         if last in next_dict:
             for w2 in next_dict[last]:
-                phrase = q_raw + " " + w2  # original query + next word
+                phrase = q_raw + " " + w2  
                 if phrase not in seen:
                     seen.add(phrase)
                     suggestions.append(phrase)
                 if len(suggestions) >= max_suggestions:
                     return suggestions
 
-    # 2) prefix: exact prefix match (service name)
+
     if q in prefix_dict and len(suggestions) < max_suggestions:
         for phrase in prefix_dict[q]:
             if phrase.lower() == q:
@@ -249,7 +233,7 @@ def suggest_queries(
             if len(suggestions) >= max_suggestions:
                 return suggestions
 
-    # 3) shorter prefixes (right-to-left)
+ 
     if words and len(suggestions) < max_suggestions:
         for i in range(len(words), 0, -1):
             prefix = " ".join(words[:i])
