@@ -181,7 +181,6 @@ def build_lexical_models(
 @st.cache_data
 def get_lexical_data(path: str = "mygov_data.json"):
     docs = load_search_documents(path)
-    # এখানে ৬টা মানই return করছি
     return build_lexical_models(docs)
 
 
@@ -266,7 +265,7 @@ def suggest_queries(
             if len(suggestions) >= max_suggestions:
                 break
 
-    # 4) fallback: substring search
+
     if len(suggestions) < max_suggestions:
         for phrase in all_phrases:
             if q in phrase.lower() and phrase not in seen and phrase.lower() != q:
@@ -278,18 +277,26 @@ def suggest_queries(
     return suggestions[:max_suggestions]
 
 
-# ---------- Streamlit UI ----------
+
 
 st.title("txtai Search (MyGov)")
 st.write("Type a query below to search your MyGov dataset.")
 
+if "query_text" not in st.session_state:
+    st.session_state["query_text"] = ""
+
+
+def set_query(new_q: str):
+    st.session_state["query_text"] = new_q
+
+
 query_text = st.text_input("Search query", key="query_text")
 
-# এখানে এখন ৬টা জিনিসই পাচ্ছি
+
 prefix_bn, prefix_en, all_bn, all_en, next_bn, next_en = get_lexical_data()
 
 if query_text:
-    # 1) live suggestions (word-by-word)
+ 
     suggestions = suggest_queries(
         query_text,
         prefix_bn,
@@ -303,12 +310,11 @@ if query_text:
 
     if suggestions:
         for i, s in enumerate(suggestions):
-            if st.button(s, key=f"sugg_{i}"):
-                st.session_state.query_text = s
-                st.experimental_rerun()
+        
+            st.button(s, key=f"sugg_{i}", on_click=set_query, args=(s,))
 
-    # 2) search with current query_text (or clicked suggestion)
-    search_query = st.session_state.query_text
+
+    search_query = query_text
     query_embedding = get_embedding(search_query)
     results = table.search(query_embedding).limit(10).to_list()
 
