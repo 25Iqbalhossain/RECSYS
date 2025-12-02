@@ -1,73 +1,140 @@
 import json
 from collections import defaultdict, Counter
 from functools import lru_cache
-from typing import List, Optional
-import lancedb
-import openai
+from typing import List, Optional, Dict, Tuple
+
 from fastapi import FastAPI
-from lancedb.pydantic import LanceModel, Vector
 from pydantic import BaseModel, Field
 
+from openai import OpenAI
+import psycopg
+from pgvector.psycopg import register_vector, Vector as PgVector
+
+# =========================
+# CONFIG
+# =========================
+
+EMBEDDING_MODEL = "local-model"  # same model used when indexing
+EMBEDDING_DIM = 768              # same dimension used in pgvector table
+
+PG_HOST = "localhost"
+PG_PORT = 5432
+PG_DB = "mgov"
+PG_USER = "postgres"
+PG_PASSWORD = "postgres"
+
+MYGOV_JSON_PATH = "mygov_data.json"  # lexical layer-এর জন্য JSON
 
 
-client = openai.OpenAI(base_url="http://localhost:1234/v1", api_key="not-needed")
+client = OpenAI(
+    base_url="http://localhost:1234/v1",
+    api_key="not-needed",
+)
 
 
-def get_embedding(text: str, prefix: str = "search_query: "):
-    response = client.embeddings.create(model="local-model", input=prefix + text)
-    
-    return response.data[0].embedding[:256]
+# =========================
+# PG / PGVECTOR
+# =========================
+
+def get_pg_conn():
+    conn = psycopg.connect(
+        host=PG_HOST,
+        port=PG_PORT,
+        dbname=PG_DB,
+        user=PG_USER,
+        password=PG_PASSWORD,
+        autocommit=True,
+    )
+    register_vector(conn)
+    return conn
 
 
-
-db_path = "./lancedb"
-db = lancedb.connect(db_path)
-table_name = "txtai_lancedb"
-
-
-class Document(LanceModel):
-    id: int = Field()
-    text: str = Field()
-    vector: Vector(256) = Field()
-
-
-if table_name not in db.table_names():
-    table = db.create_table(table_name, schema=Document)
-else:
-    table = db.open_table(table_name)
-
-
-
-@lru_cache(maxsize=1)
-def load_service_metadata(path: str = "mygov_data.json"):
+def init_schema():
     """
-    index -> { bn, en }
+    extension + table + index আছে কি না নিশ্চিত করি।
+    এখানে ডাটা insert করা হচ্ছে না – সেটা আলাদা indexing script দিয়ে করবে।
     """
-    data = {}
-    try:
-        with open(path, "r", encoding="utf-8", errors="ignore") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                row = json.loads(line)
-                idx = int(row["index"])
-                data[idx] = {
-                    "bn": str(row.get("my_gov_service_name", "") or "").strip(),
-                    "en": str(row.get("my_gov_service_name_en", "") or "").strip(),
-                }
-    except FileNotFoundError:
-        pass
-    return data
+    with get_pg_conn() as conn, conn.cursor() as cur:
+        cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
+        cur.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS mygov_services (
+                id          bigserial PRIMARY KEY,
+                doc_id      text UNIQUE,
+                bn_name     text,
+                en_name     text,
+                keywords    text,
+                profile     text,
+                embedding   vector({EMBEDDING_DIM}) NOT NULL
+            );
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS mygov_services_embedding_idx
+            ON mygov_services
+            USING ivfflat (embedding vector_cosine_ops)
+            WITH (lists = 100);
+            """
+        )
 
 
-service_meta = load_service_metadata()
+def pg_vector_search(embedding: List[float], top_k: int = 10):
+    """
+    pgvector দিয়ে cosine distance-ভিত্তিক search
+    NOTE: এখানে embedding-কে PgVector এ কনভার্ট করছি,
+    যাতে 'vector <=> vector' অপারেটর ঠিকভাবে কাজ করে।
+    """
+    vec = PgVector(embedding)
+
+    with get_pg_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT
+                doc_id,
+                bn_name,
+                en_name,
+                keywords,
+                profile,
+                1 - (embedding <=> %s) AS score
+            FROM mygov_services
+            ORDER BY embedding <=> %s
+            LIMIT %s;
+            """,
+            (vec, vec, top_k),
+        )
+        rows = cur.fetchall()
+    return rows
 
 
-def load_search_documents(path: str = "mygov_data.json"):
+# =========================
+# EMBEDDINGS
+# =========================
+
+def get_embedding(text: str) -> List[float]:
+    """
+    query embedding — indexing এর সময় যে model+dim ব্যবহার করেছো,
+    এখানে সেটাই match করতে হবে।
+    """
+    resp = client.embeddings.create(
+        model=EMBEDDING_MODEL,
+        input=text,
+    )
+    emb = resp.data[0].embedding
+    # dimension match করা দরকার
+    if len(emb) > EMBEDDING_DIM:
+        emb = emb[:EMBEDDING_DIM]
+    return list(emb)
+
+
+# =========================
+# DATA LOAD (search docs + lexical)
+# =========================
+
+def load_search_documents(path: str = MYGOV_JSON_PATH):
     """
     docs:
-      - text -> full text (name + keyword + profile) for embedding search
+      - text -> full text (name + keyword + profile) for lexical build
       - bn   -> Bangla service name
       - en   -> English service name
     """
@@ -80,8 +147,6 @@ def load_search_documents(path: str = "mygov_data.json"):
                     continue
                 row = json.loads(line)
 
-                uid = int(row["index"])
-
                 bn = str(row.get("my_gov_service_name", "") or "").strip()
                 en = str(row.get("my_gov_service_name_en", "") or "").strip()
                 keywords = str(row.get("my_gov_service_keyword", "") or "").strip()
@@ -92,17 +157,20 @@ def load_search_documents(path: str = "mygov_data.json"):
                 if not text:
                     continue
 
-                docs.append({"id": uid, "text": text, "bn": bn, "en": en})
+                docs.append({"bn": bn, "en": en, "text": text})
     except FileNotFoundError:
         pass
     return docs
 
 
-# -------------------------
-# Lexical models
-# -------------------------
+# =========================
+# LEXICAL LAYER (BN + EN)
+# =========================
+
 def build_lexical_models(
-    docs, max_prefix_len: int = 1, max_per_prefix: int = 10
+    docs,
+    max_prefix_len: int = 1,
+    max_per_prefix: int = 10,
 ):
     """
     returns:
@@ -115,10 +183,10 @@ def build_lexical_models(
       vocab_bn : list of all Bangla words
       vocab_en : list of all English words
     """
-    prefix_map_bn: dict[str, Counter] = defaultdict(Counter)
-    prefix_map_en: dict[str, Counter] = defaultdict(Counter)
-    bigram_bn: dict[str, Counter] = defaultdict(Counter)
-    bigram_en: dict[str, Counter] = defaultdict(Counter)
+    prefix_map_bn: Dict[str, Counter] = defaultdict(Counter)
+    prefix_map_en: Dict[str, Counter] = defaultdict(Counter)
+    bigram_bn: Dict[str, Counter] = defaultdict(Counter)
+    bigram_en: Dict[str, Counter] = defaultdict(Counter)
 
     all_bn = set()
     all_en = set()
@@ -130,26 +198,23 @@ def build_lexical_models(
         bn_phrase = (d["bn"] or "").strip()
         en_phrase = (d["en"] or "").strip()
 
-       
+        # Bangla side
         if bn_phrase:
             all_bn.add(bn_phrase)
             phrase = bn_phrase.lower()
             words = phrase.split()
 
-           
             for w in words:
                 vocab_bn.add(w)
 
-         
             for i in range(1, min(len(words), max_prefix_len) + 1):
                 prefix = " ".join(words[:i])
                 prefix_map_bn[prefix][bn_phrase] += 1
 
-           
             for w1, w2 in zip(words, words[1:]):
                 bigram_bn[w1][w2] += 1
 
-     
+        # English side
         if en_phrase:
             all_en.add(en_phrase)
             phrase_en = en_phrase.lower()
@@ -165,21 +230,21 @@ def build_lexical_models(
             for w1, w2 in zip(words_en, words_en[1:]):
                 bigram_en[w1][w2] += 1
 
-    prefix_bn: dict[str, list[str]] = {}
+    prefix_bn: Dict[str, List[str]] = {}
     for prefix, counter in prefix_map_bn.items():
         phrases = [p for p, _ in counter.most_common(max_per_prefix)]
         prefix_bn[prefix] = phrases
 
-    prefix_en: dict[str, list[str]] = {}
+    prefix_en: Dict[str, List[str]] = {}
     for prefix, counter in prefix_map_en.items():
         phrases = [p for p, _ in counter.most_common(max_per_prefix)]
         prefix_en[prefix] = phrases
 
-    next_bn: dict[str, list[str]] = {}
+    next_bn: Dict[str, List[str]] = {}
     for w1, counter in bigram_bn.items():
         next_bn[w1] = [w2 for w2, _ in counter.most_common()]
 
-    next_en: dict[str, list[str]] = {}
+    next_en: Dict[str, List[str]] = {}
     for w1, counter in bigram_en.items():
         next_en[w1] = [w2 for w2, _ in counter.most_common()]
 
@@ -202,7 +267,7 @@ def build_lexical_models(
 
 
 @lru_cache(maxsize=1)
-def get_lexical_data(path: str = "mygov_data.json"):
+def get_lexical_data(path: str = MYGOV_JSON_PATH):
     docs = load_search_documents(path)
     return build_lexical_models(docs)
 
@@ -216,16 +281,16 @@ def is_bangla(text: str) -> bool:
 
 def suggest_queries(
     query: str,
-    prefix_bn: dict[str, list[str]],
-    prefix_en: dict[str, list[str]],
-    all_bn: list[str],
-    all_en: list[str],
-    next_bn: dict[str, list[str]],
-    next_en: dict[str, list[str]],
-    vocab_bn: list[str],
-    vocab_en: list[str],
+    prefix_bn: Dict[str, List[str]],
+    prefix_en: Dict[str, List[str]],
+    all_bn: List[str],
+    all_en: List[str],
+    next_bn: Dict[str, List[str]],
+    next_en: Dict[str, List[str]],
+    vocab_bn: List[str],
+    vocab_en: List[str],
     max_suggestions: int = 5,
-) -> list[str]:
+) -> List[str]:
     q_raw = query.strip()
     if not q_raw:
         return []
@@ -238,13 +303,13 @@ def suggest_queries(
     next_dict = next_bn if use_bn else next_en
     vocab = vocab_bn if use_bn else vocab_en
 
-    suggestions: list[str] = []
+    suggestions: List[str] = []
     seen = set()
 
     words_raw = q_raw.split()
     words = q.split()
 
-
+    # 0) last word completion
     if words:
         last_word = words[-1]
         completions = [
@@ -260,10 +325,7 @@ def suggest_queries(
             if len(suggestions) >= max_suggestions:
                 return suggestions
 
-    # --------------------------------
-    # STEP 1: bigram-based next word
-    # application -> application for
-    # --------------------------------
+    # 1) bigram next word
     if words:
         last = words[-1]
         if last in next_dict:
@@ -275,7 +337,7 @@ def suggest_queries(
                 if len(suggestions) >= max_suggestions:
                     return suggestions
 
-
+    # 2) full prefix -> phrase
     if q in prefix_dict and len(suggestions) < max_suggestions:
         for phrase in prefix_dict[q]:
             if phrase.lower() == q:
@@ -286,7 +348,7 @@ def suggest_queries(
             if len(suggestions) >= max_suggestions:
                 return suggestions
 
-
+    # 3) smaller prefix fallback
     if words and len(suggestions) < max_suggestions:
         for i in range(len(words), 0, -1):
             prefix = " ".join(words[:i])
@@ -302,7 +364,7 @@ def suggest_queries(
             if len(suggestions) >= max_suggestions:
                 break
 
-   
+    # 4) substring match fallback
     if len(suggestions) < max_suggestions:
         for phrase in all_phrases:
             if q in phrase.lower() and phrase not in seen and phrase.lower() != q:
@@ -314,6 +376,9 @@ def suggest_queries(
     return suggestions[:max_suggestions]
 
 
+# =========================
+# SCHEMAS
+# =========================
 
 class SuggestRequest(BaseModel):
     query: str
@@ -331,7 +396,8 @@ class SearchRequest(BaseModel):
 
 
 class SearchItem(BaseModel):
-    id: int
+    # pgvector টেবিলের doc_id (string)
+    id: str = Field(..., description="Document ID (doc_id from pg)")
     bn: Optional[str] = None
     en: Optional[str] = None
     text: str
@@ -343,8 +409,16 @@ class SearchResponse(BaseModel):
     results: List[SearchItem]
 
 
+# =========================
+# FASTAPI APP
+# =========================
 
-app = FastAPI(title="MyGov txtai Search API")
+app = FastAPI(title="MyGov Search API (pgvector)")
+
+
+@app.on_event("startup")
+def on_startup():
+    init_schema()
 
 
 @app.post("/suggest", response_model=SuggestResponse)
@@ -382,27 +456,27 @@ def search_api(body: SearchRequest):
         return SearchResponse(query=body.query, results=[])
 
     query_embedding = get_embedding(query_text)
-    results_raw = table.search(query_embedding).limit(body.top_k).to_list() or []
+    rows = pg_vector_search(query_embedding, top_k=body.top_k)
 
     results: List[SearchItem] = []
-    for rec in results_raw:
-        rec_id = rec["id"]
-        meta = service_meta.get(rec_id, {})
-        bn_name = meta.get("bn", "").strip() or None
-        en_name = meta.get("en", "").strip() or None
 
-        score = rec.get("_distance")
-        if isinstance(score, (int, float)):
-            score_val: Optional[float] = float(score)
-        else:
-            score_val = None
+    for doc_id, bn_name, en_name, keywords, profile, score in rows:
+        bn_name = (bn_name or "").strip() or None
+        en_name = (en_name or "").strip() or None
+        keywords = (keywords or "").strip()
+        profile = (profile or "").strip()
+
+        full_text_parts = [bn_name or "", en_name or "", keywords, profile]
+        full_text = " ".join(p for p in full_text_parts if p)
+
+        score_val: Optional[float] = float(score) if isinstance(score, (int, float)) else None
 
         results.append(
             SearchItem(
-                id=rec_id,
+                id=str(doc_id),
                 bn=bn_name,
                 en=en_name,
-                text=rec.get("text", ""),
+                text=full_text,
                 score=score_val,
             )
         )
