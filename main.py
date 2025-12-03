@@ -1,61 +1,52 @@
 import json
+import os
+import re
 from collections import defaultdict, Counter
 from functools import lru_cache
-from typing import List, Optional, Dict, Tuple
+from typing import List, Optional, Dict
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 from openai import OpenAI
 import psycopg
-from pgvector.psycopg import register_vector, Vector as PgVector
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # =========================
 # CONFIG
 # =========================
 
-EMBEDDING_MODEL = "local-model"  # same model used when indexing
-EMBEDDING_DIM = 768              # same dimension used in pgvector table
+EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "local-model")
+EMBEDDING_DIM = int(os.environ.get("EMBEDDING_DIM", 768))
 
-PG_HOST = "localhost"
-PG_PORT = 5432
-PG_DB = "mgov"
-PG_USER = "postgres"
-PG_PASSWORD = "postgres"
+DATABASE_URL = os.environ.get("DATABASE_URL")
+if not DATABASE_URL:
+    raise RuntimeError("ERROR: DATABASE_URL is not set. Please set Neon/Aiven connection string in env.")
 
-MYGOV_JSON_PATH = "mygov_data.json"  # lexical layer-এর জন্য JSON
-
+# NEW JSON FORMAT (name, name_en, keyword)
+MYGOV_JSON_PATH = os.environ.get("MYGOV_JSON_PATH", "search_service_dump.json")
 
 client = OpenAI(
-    base_url="http://localhost:1234/v1",
-    api_key="not-needed",
+    base_url=os.environ.get("OPENAI_BASE_URL", "http://localhost:1234/v1"),
+    api_key=os.environ.get("OPENAI_API_KEY", "not-needed"),
 )
 
-
 # =========================
-# PG / PGVECTOR
+# PG helper (float8[] embeddings)
 # =========================
 
-def get_pg_conn():
-    conn = psycopg.connect(
-        host=PG_HOST,
-        port=PG_PORT,
-        dbname=PG_DB,
-        user=PG_USER,
-        password=PG_PASSWORD,
-        autocommit=True,
-    )
-    register_vector(conn)
-    return conn
+def get_pg_conn(connect_timeout: int = 5):
+    return psycopg.connect(DATABASE_URL, autocommit=True, connect_timeout=connect_timeout)
 
 
 def init_schema():
     """
-    extension + table + index আছে কি না নিশ্চিত করি।
-    এখানে ডাটা insert করা হচ্ছে না – সেটা আলাদা indexing script দিয়ে করবে।
+    Mirror app.py: create mygov_services with FLOAT8[] embeddings,
+    matching the table populated by txtai-search.py / app.py.
     """
     with get_pg_conn() as conn, conn.cursor() as cur:
-        cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
         cur.execute(
             f"""
             CREATE TABLE IF NOT EXISTS mygov_services (
@@ -65,315 +56,359 @@ def init_schema():
                 en_name     text,
                 keywords    text,
                 profile     text,
-                embedding   vector({EMBEDDING_DIM}) NOT NULL
+                embedding   FLOAT8[] NOT NULL
             );
             """
         )
         cur.execute(
             """
-            CREATE INDEX IF NOT EXISTS mygov_services_embedding_idx
-            ON mygov_services
-            USING ivfflat (embedding vector_cosine_ops)
-            WITH (lists = 100);
+            CREATE INDEX IF NOT EXISTS mygov_services_text_idx
+            ON mygov_services (bn_name, en_name, keywords);
             """
         )
 
 
-def pg_vector_search(embedding: List[float], top_k: int = 10):
+def pg_vector_search(embedding: List[float], query_text: str, top_k: int = 10):
     """
-    pgvector দিয়ে cosine distance-ভিত্তিক search
-    NOTE: এখানে embedding-কে PgVector এ কনভার্ট করছি,
-    যাতে 'vector <=> vector' অপারেটর ঠিকভাবে কাজ করে।
+    Semantic search with lexical boost using FLOAT8[] embeddings,
+    matching app.py's float8[] cosine logic.
     """
-    vec = PgVector(embedding)
+    # L2-normalize query so dot product ~= cosine
+    s = sum(float(v) * float(v) for v in embedding)
+    if s > 0:
+        norm = s ** 0.5
+        q_norm = [float(v) / norm for v in embedding]
+    else:
+        q_norm = [0.0] * len(embedding)
+
+    # derive lexical pattern (use longest token)
+    pattern = None
+    if query_text:
+        tokens = re.findall(r"[A-Za-z\u0980-\u09FF]{3,}", query_text)
+        if tokens:
+            key = max(tokens, key=len)
+            pattern = f"%{key}%"
+        else:
+            pattern = f"%{query_text}%"
 
     with get_pg_conn() as conn, conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT
-                doc_id,
-                bn_name,
-                en_name,
-                keywords,
-                profile,
-                1 - (embedding <=> %s) AS score
-            FROM mygov_services
-            ORDER BY embedding <=> %s
-            LIMIT %s;
-            """,
-            (vec, vec, top_k),
-        )
-        rows = cur.fetchall()
-    return rows
+        rows = []
+
+        # 1) lexical + vector filter
+        if pattern:
+            cur.execute(
+                """
+                SELECT
+                    id::text AS doc_id,
+                    bn_name  AS name,
+                    en_name  AS name_en,
+                    keywords AS keyword,
+                    (
+                      SELECT SUM(a*b)
+                      FROM unnest(%s::double precision[]) WITH ORDINALITY AS qa(a, idx)
+                      JOIN unnest(embedding) WITH ORDINALITY AS qe(b, idx) USING (idx)
+                    )::double precision AS score
+                FROM mygov_services
+                WHERE
+                    COALESCE(en_name, '') ILIKE %s
+                    OR COALESCE(bn_name, '') ILIKE %s
+                    OR COALESCE(keywords, '') ILIKE %s
+                ORDER BY score DESC NULLS LAST
+                LIMIT %s;
+                """,
+                (q_norm, pattern, pattern, pattern, top_k),
+            )
+            rows = cur.fetchall()
+
+        # 2) fallback: pure vector dot product ranking
+        if not rows:
+            cur.execute(
+                """
+                SELECT
+                    id::text AS doc_id,
+                    bn_name  AS name,
+                    en_name  AS name_en,
+                    keywords AS keyword,
+                    (
+                      SELECT SUM(a*b)
+                      FROM unnest(%s::double precision[]) WITH ORDINALITY AS qa(a, idx)
+                      JOIN unnest(embedding) WITH ORDINALITY AS qe(b, idx) USING (idx)
+                    )::double precision AS score
+                FROM mygov_services
+                ORDER BY score DESC NULLS LAST
+                LIMIT %s;
+                """,
+                (q_norm, top_k),
+            )
+            rows = cur.fetchall()
+
+        return rows
 
 
 # =========================
-# EMBEDDINGS
+# EMBEDDING
 # =========================
 
 def get_embedding(text: str) -> List[float]:
-    """
-    query embedding — indexing এর সময় যে model+dim ব্যবহার করেছো,
-    এখানে সেটাই match করতে হবে।
-    """
     resp = client.embeddings.create(
         model=EMBEDDING_MODEL,
         input=text,
     )
+
     emb = resp.data[0].embedding
-    # dimension match করা দরকার
+
     if len(emb) > EMBEDDING_DIM:
         emb = emb[:EMBEDDING_DIM]
-    return list(emb)
+    elif len(emb) < EMBEDDING_DIM:
+        emb = list(emb) + [0.0] * (EMBEDDING_DIM - len(emb))
+
+    return emb
 
 
 # =========================
-# DATA LOAD (search docs + lexical)
+# LOAD NEW JSON FORMAT
 # =========================
+
+_WORD_RE = re.compile(r"[\w\u0980-\u09FF]+", flags=re.UNICODE)
+_trail_re = re.compile(r"[\s\-\:\,\;\(\)\[\]\/\\]+$")
+
+
+def clean_for_vocab(s: str) -> str:
+    if not s:
+        return ""
+    s2 = " ".join(_WORD_RE.findall(s.lower()))
+    return s2.strip()
+
+
+def make_display_phrase(orig: str, max_len: int = 80) -> str:
+    if not orig:
+        return ""
+    s = orig.strip()
+    s = _trail_re.sub("", s)
+    s = re.sub(r"\s*\([^)]{0,120}\)\s*$", "", s).strip()
+    s = " ".join(s.split())
+    if len(s) > max_len:
+        cut = s.rfind(" ", 0, max_len)
+        if cut == -1:
+            s = s[:max_len].rstrip() + ""
+        else:
+            s = s[:cut].rstrip() + ""
+    return s
+
 
 def load_search_documents(path: str = MYGOV_JSON_PATH):
-    """
-    docs:
-      - text -> full text (name + keyword + profile) for lexical build
-      - bn   -> Bangla service name
-      - en   -> English service name
-    """
     docs = []
     try:
-        with open(path, "r", encoding="utf-8", errors="ignore") as f:
-            for line in f:
+        raw = open(path, "r", encoding="utf-8").read().strip()
+    except Exception:
+        return docs
+
+    if not raw:
+        return docs
+
+    rows = []
+    if raw.startswith("[") or raw.startswith("{"):
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, list):
+                rows = parsed
+            else:
+                rows = [parsed]
+        except Exception:
+            for line in raw.splitlines():
                 line = line.strip()
                 if not line:
                     continue
-                row = json.loads(line)
-
-                bn = str(row.get("my_gov_service_name", "") or "").strip()
-                en = str(row.get("my_gov_service_name_en", "") or "").strip()
-                keywords = str(row.get("my_gov_service_keyword", "") or "").strip()
-                profile = str(row.get("nsp_profile_name", "") or "").strip()
-
-                parts_full = [bn, en, keywords, profile]
-                text = " ".join(p for p in parts_full if p)
-                if not text:
+                try:
+                    rows.append(json.loads(line))
+                except Exception:
                     continue
+    else:
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except Exception:
+                continue
 
-                docs.append({"bn": bn, "en": en, "text": text})
-    except FileNotFoundError:
-        pass
+    for r in rows:
+        bn = (r.get("my_gov_service_name") or r.get("name") or r.get("bn") or "").strip()
+        en = (r.get("my_gov_service_name_en") or r.get("name_en") or r.get("en") or "").strip()
+        kw = (r.get("my_gov_service_keyword") or r.get("keyword") or r.get("keywords") or "").strip()
+        text = " ".join([x for x in [bn, en, kw] if x]).strip()
+        if not text:
+            continue
+
+        docs.append({
+            "bn": bn,
+            "en": en,
+            "keyword": kw,
+            "text": text,
+            "bn_clean": clean_for_vocab(bn),
+            "en_clean": clean_for_vocab(en),
+            "text_clean": clean_for_vocab(text),
+            "bn_display": make_display_phrase(bn),
+            "en_display": make_display_phrase(en),
+        })
+
     return docs
 
 
 # =========================
-# LEXICAL LAYER (BN + EN)
+# LEXICAL SUGGESTION LAYER
 # =========================
 
-def build_lexical_models(
-    docs,
-    max_prefix_len: int = 1,
-    max_per_prefix: int = 10,
-):
-    """
-    returns:
-      prefix_bn: prefix -> [Bangla phrases]
-      prefix_en: prefix -> [English phrases]
-      all_bn   : list of all unique Bangla names
-      all_en   : list of all unique English names
-      next_bn  : word  -> [next words]  (bigram)
-      next_en  : word  -> [next words]  (bigram)
-      vocab_bn : list of all Bangla words
-      vocab_en : list of all English words
-    """
-    prefix_map_bn: Dict[str, Counter] = defaultdict(Counter)
-    prefix_map_en: Dict[str, Counter] = defaultdict(Counter)
-    bigram_bn: Dict[str, Counter] = defaultdict(Counter)
-    bigram_en: Dict[str, Counter] = defaultdict(Counter)
-
-    all_bn = set()
-    all_en = set()
-
+def build_lexical_models(docs):
+    prefix_map_bn = defaultdict(Counter)
+    prefix_map_en = defaultdict(Counter)
+    bigram_bn = defaultdict(Counter)
+    bigram_en = defaultdict(Counter)
     vocab_bn = set()
     vocab_en = set()
+    all_bn = set()
+    all_en = set()
+    allowed_bn_phrases = set()
+    allowed_en_phrases = set()
 
     for d in docs:
-        bn_phrase = (d["bn"] or "").strip()
-        en_phrase = (d["en"] or "").strip()
+        bn = (d.get("bn") or "").strip()
+        en = (d.get("en") or "").strip()
+        bn_clean = (d.get("bn_clean") or "").strip()
+        en_clean = (d.get("en_clean") or "").strip()
+        bn_disp = d.get("bn_display") or bn
+        en_disp = d.get("en_display") or en
 
-        # Bangla side
-        if bn_phrase:
-            all_bn.add(bn_phrase)
-            phrase = bn_phrase.lower()
-            words = phrase.split()
-
+        if bn:
+            all_bn.add(bn_disp)
+            allowed_bn_phrases.add(bn_disp)
+            words = bn_clean.split() if bn_clean else []
             for w in words:
                 vocab_bn.add(w)
-
-            for i in range(1, min(len(words), max_prefix_len) + 1):
+            for i in range(1, min(3, len(words)) + 1):
                 prefix = " ".join(words[:i])
-                prefix_map_bn[prefix][bn_phrase] += 1
-
+                prefix_map_bn[prefix][bn_disp] += 1
             for w1, w2 in zip(words, words[1:]):
                 bigram_bn[w1][w2] += 1
 
-        # English side
-        if en_phrase:
-            all_en.add(en_phrase)
-            phrase_en = en_phrase.lower()
-            words_en = phrase_en.split()
-
-            for w in words_en:
+        if en:
+            all_en.add(en_disp)
+            allowed_en_phrases.add(en_disp)
+            words = en_clean.split() if en_clean else []
+            for w in words:
                 vocab_en.add(w)
-
-            for i in range(1, min(len(words_en), max_prefix_len) + 1):
-                prefix = " ".join(words_en[:i])
-                prefix_map_en[prefix][en_phrase] += 1
-
-            for w1, w2 in zip(words_en, words_en[1:]):
+            for i in range(1, min(3, len(words)) + 1):
+                prefix = " ".join(words[:i])
+                prefix_map_en[prefix][en_disp] += 1
+            for w1, w2 in zip(words, words[1:]):
                 bigram_en[w1][w2] += 1
 
-    prefix_bn: Dict[str, List[str]] = {}
-    for prefix, counter in prefix_map_bn.items():
-        phrases = [p for p, _ in counter.most_common(max_per_prefix)]
-        prefix_bn[prefix] = phrases
+    prefix_bn_map = {p: [x for x, _ in c.most_common()] for p, c in prefix_map_bn.items()}
+    prefix_en_map = {p: [x for x, _ in c.most_common()] for p, c in prefix_map_en.items()}
+    next_bn_map = {w: [x for x, _ in c.most_common()] for w, c in bigram_bn.items()}
+    next_en_map = {w: [x for x, _ in c.most_common()] for w, c in bigram_en.items()}
 
-    prefix_en: Dict[str, List[str]] = {}
-    for prefix, counter in prefix_map_en.items():
-        phrases = [p for p, _ in counter.most_common(max_per_prefix)]
-        prefix_en[prefix] = phrases
-
-    next_bn: Dict[str, List[str]] = {}
-    for w1, counter in bigram_bn.items():
-        next_bn[w1] = [w2 for w2, _ in counter.most_common()]
-
-    next_en: Dict[str, List[str]] = {}
-    for w1, counter in bigram_en.items():
-        next_en[w1] = [w2 for w2, _ in counter.most_common()]
-
-    all_bn_list = sorted(all_bn)
-    all_en_list = sorted(all_en)
-
-    vocab_bn_list = sorted(vocab_bn)
-    vocab_en_list = sorted(vocab_en)
-
-    return (
-        prefix_bn,
-        prefix_en,
-        all_bn_list,
-        all_en_list,
-        next_bn,
-        next_en,
-        vocab_bn_list,
-        vocab_en_list,
-    )
+    return {
+        "prefix_bn": prefix_bn_map,
+        "prefix_en": prefix_en_map,
+        "all_bn": sorted(all_bn),
+        "all_en": sorted(all_en),
+        "next_bn": next_bn_map,
+        "next_en": next_en_map,
+        "vocab_bn": sorted(vocab_bn),
+        "vocab_en": sorted(vocab_en),
+        "allowed_bn_phrases": allowed_bn_phrases,
+        "allowed_en_phrases": allowed_en_phrases,
+    }
 
 
 @lru_cache(maxsize=1)
-def get_lexical_data(path: str = MYGOV_JSON_PATH):
-    docs = load_search_documents(path)
-    return build_lexical_models(docs)
+def get_lexical_data():
+    docs = load_search_documents()
+    model = build_lexical_models(docs)
+    # If build_lexical_models returns the newer dict format (like in app.py),
+    # convert it to the tuple structure that suggest_queries currently expects.
+    if isinstance(model, dict):
+        return (
+            model["prefix_bn"],
+            model["prefix_en"],
+            model["all_bn"],
+            model["all_en"],
+            model["next_bn"],
+            model["next_en"],
+            model["vocab_bn"],
+            model["vocab_en"],
+        )
+    return model
 
 
 def is_bangla(text: str) -> bool:
-    for ch in text:
-        if "\u0980" <= ch <= "\u09FF":
-            return True
-    return False
+    return any("\u0980" <= ch <= "\u09FF" for ch in text)
 
 
-def suggest_queries(
-    query: str,
-    prefix_bn: Dict[str, List[str]],
-    prefix_en: Dict[str, List[str]],
-    all_bn: List[str],
-    all_en: List[str],
-    next_bn: Dict[str, List[str]],
-    next_en: Dict[str, List[str]],
-    vocab_bn: List[str],
-    vocab_en: List[str],
-    max_suggestions: int = 5,
-) -> List[str]:
-    q_raw = query.strip()
-    if not q_raw:
+def suggest_queries(query: str, limit: int = 5):
+    (
+        prefix_bn,
+        prefix_en,
+        all_bn,
+        all_en,
+        next_bn,
+        next_en,
+        vocab_bn,
+        vocab_en,
+    ) = get_lexical_data()
+
+    q = query.strip().lower()
+    if not q:
         return []
 
-    use_bn = is_bangla(q_raw)
-    q = q_raw.lower()
+    use_bn = is_bangla(q)
 
+    vocab = vocab_bn if use_bn else vocab_en
+    next_dict = next_bn if use_bn else next_en
     prefix_dict = prefix_bn if use_bn else prefix_en
     all_phrases = all_bn if use_bn else all_en
-    next_dict = next_bn if use_bn else next_en
-    vocab = vocab_bn if use_bn else vocab_en
 
-    suggestions: List[str] = []
+    suggestions = []
     seen = set()
 
-    words_raw = q_raw.split()
     words = q.split()
 
-    # 0) last word completion
+    # 1) last word completion
     if words:
-        last_word = words[-1]
-        completions = [
-            w for w in vocab
-            if w.startswith(last_word) and w != last_word
-        ]
-        for w in completions:
-            new_tokens = words_raw[:-1] + [w]
-            phrase = " ".join(new_tokens)
-            if phrase not in seen:
-                seen.add(phrase)
-                suggestions.append(phrase)
-            if len(suggestions) >= max_suggestions:
-                return suggestions
+        last = words[-1]
+        for w in vocab:
+            if w.startswith(last) and w != last:
+                suggestion = " ".join(words[:-1] + [w])
+                if suggestion not in seen:
+                    seen.add(suggestion)
+                    suggestions.append(suggestion)
+                    if len(suggestions) >= limit:
+                        return suggestions
 
-    # 1) bigram next word
+    # 2) bigram next word
     if words:
         last = words[-1]
         if last in next_dict:
             for w2 in next_dict[last]:
-                phrase = q_raw + " " + w2
-                if phrase not in seen:
-                    seen.add(phrase)
-                    suggestions.append(phrase)
-                if len(suggestions) >= max_suggestions:
+                suggestion = query + " " + w2
+                if suggestion not in seen:
+                    seen.add(suggestion)
+                    suggestions.append(suggestion)
+                    if len(suggestions) >= limit:
+                        return suggestions
+
+    # 3) prefix → phrase
+    if q in prefix_dict:
+        for phrase in prefix_dict[q]:
+            if phrase.lower() != q and phrase not in seen:
+                suggestions.append(phrase)
+                seen.add(phrase)
+                if len(suggestions) >= limit:
                     return suggestions
 
-    # 2) full prefix -> phrase
-    if q in prefix_dict and len(suggestions) < max_suggestions:
-        for phrase in prefix_dict[q]:
-            if phrase.lower() == q:
-                continue
-            if phrase not in seen:
-                seen.add(phrase)
-                suggestions.append(phrase)
-            if len(suggestions) >= max_suggestions:
-                return suggestions
-
-    # 3) smaller prefix fallback
-    if words and len(suggestions) < max_suggestions:
-        for i in range(len(words), 0, -1):
-            prefix = " ".join(words[:i])
-            if prefix in prefix_dict:
-                for phrase in prefix_dict[prefix]:
-                    if phrase.lower() == q:
-                        continue
-                    if phrase not in seen:
-                        seen.add(phrase)
-                        suggestions.append(phrase)
-                    if len(suggestions) >= max_suggestions:
-                        break
-            if len(suggestions) >= max_suggestions:
-                break
-
-    # 4) substring match fallback
-    if len(suggestions) < max_suggestions:
-        for phrase in all_phrases:
-            if q in phrase.lower() and phrase not in seen and phrase.lower() != q:
-                seen.add(phrase)
-                suggestions.append(phrase)
-                if len(suggestions) >= max_suggestions:
-                    break
-
-    return suggestions[:max_suggestions]
+    return suggestions[:limit]
 
 
 # =========================
@@ -382,7 +417,7 @@ def suggest_queries(
 
 class SuggestRequest(BaseModel):
     query: str
-    max_suggestions: int = 5
+    limit: int = 5
 
 
 class SuggestResponse(BaseModel):
@@ -396,12 +431,9 @@ class SearchRequest(BaseModel):
 
 
 class SearchItem(BaseModel):
-    # pgvector টেবিলের doc_id (string)
-    id: str = Field(..., description="Document ID (doc_id from pg)")
-    bn: Optional[str] = None
-    en: Optional[str] = None
-    text: str
-    score: Optional[float] = None
+    name: Optional[str]
+    name_en: Optional[str]
+    keyword: Optional[str]
 
 
 class SearchResponse(BaseModel):
@@ -413,72 +445,44 @@ class SearchResponse(BaseModel):
 # FASTAPI APP
 # =========================
 
-app = FastAPI(title="MyGov Search API (pgvector)")
+app = FastAPI(title="MyGov Search API (New JSON)")
 
 
 @app.on_event("startup")
-def on_startup():
-    init_schema()
+def startup():
+    try:
+        init_schema()
+    except Exception as e:
+        print("DB init failed:", e)
 
 
 @app.post("/suggest", response_model=SuggestResponse)
 def suggest_api(body: SuggestRequest):
-    (
-        prefix_bn,
-        prefix_en,
-        all_bn,
-        all_en,
-        next_bn,
-        next_en,
-        vocab_bn,
-        vocab_en,
-    ) = get_lexical_data()
-
-    suggestions = suggest_queries(
-        body.query,
-        prefix_bn,
-        prefix_en,
-        all_bn,
-        all_en,
-        next_bn,
-        next_en,
-        vocab_bn,
-        vocab_en,
-        max_suggestions=body.max_suggestions,
-    )
+    suggestions = suggest_queries(body.query, body.limit)
     return SuggestResponse(query=body.query, suggestions=suggestions)
 
 
 @app.post("/search", response_model=SearchResponse)
 def search_api(body: SearchRequest):
-    query_text = body.query.strip()
-    if not query_text:
-        return SearchResponse(query=body.query, results=[])
+    q = body.query.strip()
+    if not q:
+        return SearchResponse(query=q, results=[])
 
-    query_embedding = get_embedding(query_text)
-    rows = pg_vector_search(query_embedding, top_k=body.top_k)
+    emb = get_embedding(q)
+
+    try:
+        rows = pg_vector_search(emb, q, body.top_k)
+    except Exception as e:
+        raise HTTPException(500, f"DB search failed: {e}")
 
     results: List[SearchItem] = []
-
-    for doc_id, bn_name, en_name, keywords, profile, score in rows:
-        bn_name = (bn_name or "").strip() or None
-        en_name = (en_name or "").strip() or None
-        keywords = (keywords or "").strip()
-        profile = (profile or "").strip()
-
-        full_text_parts = [bn_name or "", en_name or "", keywords, profile]
-        full_text = " ".join(p for p in full_text_parts if p)
-
-        score_val: Optional[float] = float(score) if isinstance(score, (int, float)) else None
-
+    for _doc_id, name, name_en, keyword, _score in rows:
         results.append(
             SearchItem(
-                id=str(doc_id),
-                bn=bn_name,
-                en=en_name,
-                text=full_text,
-                score=score_val,
+                name=(name or None),
+                name_en=(name_en or None),
+                keyword=(keyword or None),
             )
         )
 
-    return SearchResponse(query=body.query, results=results)
+    return SearchResponse(query=q, results=results)
