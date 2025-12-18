@@ -21,10 +21,12 @@ class MyGovDB:
                 my_gov_service.name AS my_gov_service_name,
                 my_gov_service.name_en AS my_gov_service_name_en,
                 my_gov_service.keyword AS my_gov_service_keyword,
-                nsp_profile.name as nsp_profile_name
+                nsp_profile.name AS nsp_profile_name,
+                my_gov_service.sid AS my_gov_service_id
             FROM my_gov_service
             JOIN nsp_service ON my_gov_service.id = nsp_service.sid
             JOIN nsp_profile ON nsp_profile.id = nsp_service.uid;
+
         """
         cursor = self.cnx.cursor(dictionary=True)
         cursor.execute(query)
