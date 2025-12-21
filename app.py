@@ -1,8 +1,10 @@
 """
-Cache-first Gradio realtime lexical suggestion + search + streaming + perf test
+Cache-first Gradio realtime lexical suggestion + service keyword suggestions + search + streaming + perf test
+
 STRICT:
 - Load search_service_dump.json ONCE at startup
-- Suggestions ONLY from cached prefix_map + vocabulary + unigram_freq + bigram_freq
+- Token suggestions ONLY from cached prefix_map + vocabulary + unigram_freq + bigram_freq
+- Service suggestions ONLY from cached docs.keywords (same cache file)
 - No rebuilding vocab/bigram/prefix at runtime
 - Bangla-safe (no forced lowercasing for Bangla; UTF-8 safe)
 - Full prefix coverage (no silent cap); ranking only after retrieval
@@ -25,9 +27,13 @@ import gradio as gr
 CACHE_PATH = os.environ.get("MYGOV_JSON_PATH", "search_service_dump.json")
 DEFAULT_SUGGEST_TOPK = int(os.environ.get("SUGGEST_TOPK", "20"))
 DEFAULT_SEARCH_TOPK = int(os.environ.get("SEARCH_TOPK", "10"))
+DEFAULT_SERVICE_SUGGEST_TOPK = int(os.environ.get("SERVICE_SUGGEST_TOPK", "10"))
 
 # Unicode-aware token regex (Bangla + word chars)
 TOKEN_RE = re.compile(r"[\w\u0980-\u09FF]+", flags=re.UNICODE)
+
+# For keyword matching (Bangla + ASCII tokens, safe)
+KW_TOKEN_RE = re.compile(r"[\u0980-\u09FF]+|[A-Za-z0-9]+", flags=re.UNICODE)
 
 
 # -------------------------
@@ -56,18 +62,16 @@ class Cache:
     # prev_id -> {next_id -> count}
     bigram_freq: Dict[int, Dict[int, int]]
 
-    # docs for search
+    # docs for search + service suggestions
     docs: List[SearchDoc]
 
 
 def _as_int_keys(d: Dict[Any, Any]) -> Dict[int, Any]:
-    """JSON keys may be strings; convert to int keys."""
     out: Dict[int, Any] = {}
     for k, v in (d or {}).items():
         try:
             out[int(k)] = v
         except Exception:
-            # if a key isn't int-like, skip (or keep separately if needed)
             continue
     return out
 
@@ -75,16 +79,66 @@ def _as_int_keys(d: Dict[Any, Any]) -> Dict[int, Any]:
 def load_cache_once(path: str) -> Cache:
     """
     Loads the cache ONCE.
-    No recomputation of lexical structures.
-    The file must already contain vocabulary/prefix_map/unigram_freq/bigram_freq/docs.
+    Supports TWO formats:
+
+    A) Full cache dict:
+       {
+         "vocabulary": [...],
+         "prefix_map": {...},
+         "unigram_freq": {...},
+         "bigram_freq": {...},
+         "documents": [...]
+       }
+
+    B) Raw documents list:
+       [
+         {"my_gov_service_name":..., "my_gov_service_keyword":...},
+         ...
+       ]
+
+    STRICT:
+    - If format B, we DO NOT rebuild vocab/prefix/bigram.
+      Token autocomplete will be empty (by design).
     """
     with open(path, "r", encoding="utf-8") as f:
         raw = json.load(f)
 
-    # ---- expected keys (adapt if your JSON uses different names)
-    vocab = raw["vocabulary"]  # list[str] indexed by token_id
-    prefix_map = raw["prefix_map"]  # dict[str -> list[int]]
+    # -------------------------
+    # Format B: raw list of docs
+    # -------------------------
+    if isinstance(raw, list):
+        docs: List[SearchDoc] = []
+        for i, d in enumerate(raw):
+            if not isinstance(d, dict):
+                continue
+            docs.append(
+                SearchDoc(
+                    doc_id=str(d.get("doc_id") or d.get("id") or f"row_{i}"),
+                    bn=str(d.get("bn") or d.get("my_gov_service_name") or d.get("name") or ""),
+                    en=str(d.get("en") or d.get("my_gov_service_name_en") or d.get("name_en") or ""),
+                    keywords=str(d.get("keywords") or d.get("my_gov_service_keyword") or d.get("keyword") or ""),
+                    profile=str(d.get("profile") or d.get("description") or ""),
+                )
+            )
+
+        return Cache(
+            vocab=[],
+            prefix_map={},
+            unigram_freq={},
+            bigram_freq={},
+            docs=docs,
+        )
+
+    # -------------------------
+    # Format A: full cache dict
+    # -------------------------
+    if not isinstance(raw, dict):
+        raise ValueError("CACHE ERROR: search_service_dump.json must be a dict cache or list of docs")
+
+    vocab = raw.get("vocabulary", [])
+    prefix_map = raw.get("prefix_map", {})
     unigram_freq = _as_int_keys(raw.get("unigram_freq", {}))
+
     bigram_raw = raw.get("bigram_freq", {})
     bigram_freq: Dict[int, Dict[int, int]] = {}
     for prev_k, row in (bigram_raw or {}).items():
@@ -92,9 +146,7 @@ def load_cache_once(path: str) -> Cache:
             prev_id = int(prev_k)
         except Exception:
             continue
-        # row: next_id -> count
         row_int = _as_int_keys(row)
-        # ensure counts are ints
         bigram_freq[prev_id] = {int(nk): int(cv) for nk, cv in row_int.items()}
 
     docs_raw = raw.get("documents") or raw.get("search_index") or []
@@ -110,11 +162,10 @@ def load_cache_once(path: str) -> Cache:
             )
         )
 
-    # basic sanity (fail fast)
-    if not isinstance(vocab, list) or not vocab:
-        raise ValueError("CACHE ERROR: vocabulary missing/empty in search_service_dump.json")
+    if not isinstance(vocab, list):
+        raise ValueError("CACHE ERROR: 'vocabulary' must be a list when cache format is dict")
     if not isinstance(prefix_map, dict):
-        raise ValueError("CACHE ERROR: prefix_map missing in search_service_dump.json")
+        raise ValueError("CACHE ERROR: 'prefix_map' must be a dict when cache format is dict")
 
     return Cache(
         vocab=vocab,
@@ -133,28 +184,12 @@ def contains_bangla(s: str) -> bool:
 
 
 def normalize_token_for_lookup(tok: str) -> str:
-    """
-    CRITICAL:
-    - Do NOT lowercase Bangla tokens.
-    - English tokens are lowercased (typical cache build behavior).
-    If your cache stores English case-sensitively, remove lower() here.
-    """
     if contains_bangla(tok):
         return tok
     return tok.lower()
 
 
 def extract_current_prefix(query: str) -> Tuple[str, Optional[str]]:
-    """
-    Extract prefix for autocomplete and previous token (for bigram context).
-
-    Rules:
-    - If user ends with space: prefix="" and prev_token is last completed token
-    - Else: prefix=last token fragment and prev_token is token before it (if any)
-
-    Returns:
-      prefix_str, prev_token_str
-    """
     q = query or ""
     ends_with_space = bool(re.search(r"\s$", q))
 
@@ -166,25 +201,15 @@ def extract_current_prefix(query: str) -> Tuple[str, Optional[str]]:
         prev = toks[-1]
         return "", normalize_token_for_lookup(prev)
 
-    # partial last token
     prefix = toks[-1]
     prev = toks[-2] if len(toks) >= 2 else None
     return normalize_token_for_lookup(prefix), (normalize_token_for_lookup(prev) if prev else None)
 
 
 # -------------------------
-# Suggestion ranking (cache-only)
+# Token Suggestion ranking (cache-only)
 # -------------------------
-def score_candidate_token_id(
-    cache: Cache,
-    prev_token_id: Optional[int],
-    cand_token_id: int,
-) -> float:
-    """
-    Ranking ONLY, never filters:
-    - If bigram(prev->cand) exists => bigram probability proxy + unigram fallback
-    - Else unigram
-    """
+def score_candidate_token_id(cache: Cache, prev_token_id: Optional[int], cand_token_id: int) -> float:
     uni = float(cache.unigram_freq.get(cand_token_id, 0))
 
     if prev_token_id is None:
@@ -209,50 +234,40 @@ def suggest_from_cache(
     debug: bool,
 ) -> Tuple[List[Tuple[str, int]], str]:
     """
-    Returns:
-      choices: list of (display_string, token_id) for dropdown
-      debug_markdown
+    Token suggestions ONLY from prefix_map (cache-only).
+    If prefix_map is missing (list-docs format), returns empty.
     """
     prefix, prev_tok = extract_current_prefix(query)
 
-    # IMPORTANT: suggestions must come ONLY from prefix_map
-    # If prefix == "" (user typed space), we can still show next-word suggestions
-    # by using prefix_map with "" only if your cache has it.
-    # Otherwise, we rely on bigram of prev token to propose next words (still cache-only).
-    prefix_hits: List[int] = []
+    if not cache.prefix_map or not cache.vocab:
+        dbg = ""
+        if debug:
+            dbg = (
+                "### Debug (token autocomplete)\n"
+                "- prefix_map/vocab not present in cache (list-docs JSON format)\n"
+                "- STRICT: cannot rebuild lexical cache at runtime\n"
+                "- token autocomplete disabled (service suggestions still work)\n"
+            )
+        return [], dbg
 
-    if prefix in cache.prefix_map:
-        prefix_hits = cache.prefix_map[prefix]
-    else:
-        prefix_hits = []
-
-    # candidate_count_before_ranking MUST be full retrieved list length
+    prefix_hits: List[int] = cache.prefix_map.get(prefix, [])
     before = len(prefix_hits)
 
-    # Resolve prev token to token_id if possible (cache-only)
     prev_id: Optional[int] = None
     if prev_tok is not None:
-        # Build reverse vocab map ONCE (startup) for O(1). We'll attach on cache later.
-        # In this strict file, we build it once globally below.
         prev_id = VOCAB_TO_ID.get(prev_tok)
 
     candidates: List[Tuple[float, int]] = []
     for tid in prefix_hits:
-        # validate id range
         if not isinstance(tid, int) or tid < 0 or tid >= len(cache.vocab):
             continue
         sc = score_candidate_token_id(cache, prev_id, tid)
         candidates.append((sc, tid))
 
-    # Ranking after retrieval
     candidates.sort(key=lambda x: x[0], reverse=True)
     after = len(candidates)
 
-    # Top-20 debug tokens with scores (pre and post are important)
-    # NOTE: We do NOT truncate before ranking.
     top20_scored = candidates[:20]
-
-    # ONLY truncation point is here (explicit)
     truncation_note = ""
     if top_k is not None and top_k > 0 and len(candidates) > top_k:
         truncation_note = f"TRUNCATION: output limited to top_k={top_k} (after ranking only)."
@@ -267,12 +282,11 @@ def suggest_from_cache(
     debug_md = ""
     if debug:
         debug_md = (
-            "### Debug (cache autocomplete)\n"
+            "### Debug (token autocomplete)\n"
             f"- prefix: `{prefix}`\n"
             f"- prev_token: `{prev_tok}`\n"
             f"- prev_token_id: `{prev_id}`\n"
             f"- total_prefix_hits: **{before}**\n"
-            f"- candidates_before_ranking: **{before}**\n"
             f"- candidates_after_ranking: **{after}**\n"
             f"- top20_scored: `{[(cache.vocab[tid], round(sc,3)) for sc, tid in top20_scored]}`\n"
             f"- {truncation_note or 'No truncation applied.'}\n"
@@ -282,18 +296,146 @@ def suggest_from_cache(
 
 
 # -------------------------
-# Search (cache-only, lightweight lexical)
+# Service Suggestions (keyword-based, cache-only)
+# -------------------------
+def _kw_norm_token(tok: str) -> str:
+    if contains_bangla(tok):
+        return tok
+    return tok.lower()
+
+
+def _kw_extract_query_tokens(q: str) -> List[str]:
+    toks = KW_TOKEN_RE.findall((q or "").strip())
+    return [_kw_norm_token(t) for t in toks if t]
+
+
+def _kw_split_phrases(keyword: str) -> List[str]:
+    if not keyword:
+        return []
+    parts = [p.strip() for p in keyword.split(",") if p.strip()]
+    phrases: List[str] = []
+    for p in parts:
+        phrases.append(p)
+        no_paren = re.sub(r"\([^)]*\)", "", p).strip()
+        if no_paren and no_paren != p:
+            phrases.append(no_paren)
+
+    seen = set()
+    out = []
+    for p in phrases:
+        if p not in seen:
+            seen.add(p)
+            out.append(p)
+    return out
+
+
+def _kw_norm_phrase_tokens(phrase: str) -> Tuple[str, List[str]]:
+    toks = KW_TOKEN_RE.findall(phrase or "")
+    ntoks = [_kw_norm_token(t) for t in toks if t]
+    return " ".join(ntoks), ntoks
+
+
+def _kw_match_score(q_tokens: List[str], kw_tokens: List[str], kw_norm_str: str) -> int:
+    if not q_tokens:
+        return 0
+
+    score = 0
+    q_str = " ".join(q_tokens)
+
+    if len(q_tokens) >= 2 and q_str and q_str in kw_norm_str:
+        score += 50
+
+    for qt in q_tokens:
+        for kt in kw_tokens:
+            if kt == qt:
+                score += 10
+                break
+            if kt.startswith(qt) or (qt in kt):
+                score += 6
+                break
+
+    return score
+
+
+def suggest_services_by_keyword(
+    cache: Cache,
+    query: str,
+    top_k: int,
+    debug: bool,
+) -> Tuple[List[Tuple[str, str]], str]:
+    q_raw = (query or "").strip()
+    if not q_raw:
+        return [], ("### Debug (service suggestions)\n- empty query\n" if debug else "")
+
+    use_bn = contains_bangla(q_raw)
+    q_tokens = _kw_extract_query_tokens(q_raw)
+
+    dbg_lines: List[str] = []
+    if debug:
+        dbg_lines.append("### Debug (service suggestions: keyword match)")
+        dbg_lines.append(f"- query: `{q_raw}`")
+        dbg_lines.append(f"- extracted_query_tokens: `{q_tokens}`")
+
+    if not q_tokens:
+        return [], ("\n".join(dbg_lines) if debug else "")
+
+    scored: List[Tuple[int, str, str, List[str]]] = []
+    for d in cache.docs:
+        kw = (d.keywords or "").strip()
+        if not kw:
+            continue
+
+        title = (d.bn.strip() if use_bn and d.bn.strip() else d.en.strip()) or d.bn.strip() or d.en.strip()
+        if not title:
+            continue
+
+        phrases = _kw_split_phrases(kw)
+        best_score = 0
+        best_match_tokens: List[str] = []
+
+        for ph in phrases:
+            kw_norm_str, kw_tokens = _kw_norm_phrase_tokens(ph)
+            sc = _kw_match_score(q_tokens, kw_tokens, kw_norm_str)
+            if sc > best_score:
+                best_score = sc
+                best_match_tokens = kw_tokens
+
+        if best_score > 0:
+            scored.append((best_score, title, d.doc_id, best_match_tokens))
+
+    if not scored:
+        if debug:
+            dbg_lines.append("- no keyword matches -> EMPTY")
+            dbg_lines.append("- why 'Direct visa' failed before: token-prefix suggestion only, no keyword matching")
+            dbg_lines.append("- why it succeeds now: 'visa' matches keyword phrases like 'Visa on Arrival'")
+        return [], ("\n".join(dbg_lines) if debug else "")
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    out: List[Tuple[str, str]] = []
+    seen = set()
+    for sc, title, doc_id, match_tokens in scored:
+        if title in seen:
+            continue
+        seen.add(title)
+        out.append((title, doc_id))
+        if top_k and top_k > 0 and len(out) >= top_k:
+            break
+
+    if debug:
+        dbg_lines.append(f"- returned: **{len(out)}** (top_k={top_k})")
+
+    return out, ("\n".join(dbg_lines) if debug else "")
+
+
+# -------------------------
+# Search (cache-only)
 # -------------------------
 def doc_score(query: str, d: SearchDoc) -> float:
-    """
-    Cache-only search scoring (simple but consistent):
-    prefix > word-boundary > contains
-    """
     q = (query or "").strip()
     if not q:
         return -1e9
 
-    # DO NOT destroy Bangla; only lower English-ish comparisons
     q_norm = q.lower() if not contains_bangla(q) else q
 
     bn = d.bn or ""
@@ -412,7 +554,6 @@ def run_perf_test(cache: Cache, query: str, n: int, top_k: int) -> str:
     p95 = lat_ms[max(0, int(len(lat_ms) * 0.95) - 1)]
     tps = (n / total) if total > 0 else 0.0
 
-    print(f"[perf] n={n} avg_ms={avg:.2f} p50_ms={p50:.2f} p95_ms={p95:.2f} tps={tps:.2f}")
     return (
         "### Perf test result\n"
         f"- Requests: **{n}**\n"
@@ -428,26 +569,29 @@ def run_perf_test(cache: Cache, query: str, n: int, top_k: int) -> str:
 # =========================
 CACHE = load_cache_once(CACHE_PATH)
 
-# Build reverse vocab lookup ONCE (startup) for prev-token-id resolution
-# NOTE: Must match normalize_token_for_lookup behavior.
+# Reverse vocab map (only if vocab exists)
 VOCAB_TO_ID: Dict[str, int] = {}
-for tid, tok in enumerate(CACHE.vocab):
+for tid, tok in enumerate(CACHE.vocab or []):
     key = normalize_token_for_lookup(tok)
-    # keep first occurrence
     VOCAB_TO_ID.setdefault(key, tid)
 
 
 # =========================
 # Gradio Handlers
 # =========================
-def ui_update_suggestions(query: str, suggest_top_k: int, debug: bool):
+def ui_update_token_suggestions(query: str, suggest_top_k: int, debug: bool):
     t0 = time.perf_counter()
     choices, dbg = suggest_from_cache(CACHE, query, top_k=int(suggest_top_k), debug=bool(debug))
     dt = (time.perf_counter() - t0) * 1000.0
+    status = f"Token suggest latency: {dt:.2f} ms • choices_returned: {len(choices)}"
+    return gr.Dropdown(choices=choices, value=None), status, dbg
 
-    # dropdown wants choices=[(label, value)]
-    # we store value as token_id; applying sets query to that token string
-    status = f"Suggest latency: {dt:.2f} ms • choices_returned: {len(choices)}"
+
+def ui_update_service_suggestions(query: str, service_top_k: int, debug: bool):
+    t0 = time.perf_counter()
+    choices, dbg = suggest_services_by_keyword(CACHE, query, top_k=int(service_top_k), debug=bool(debug))
+    dt = (time.perf_counter() - t0) * 1000.0
+    status = f"Service suggest latency: {dt:.2f} ms • choices_returned: {len(choices)}"
     return gr.Dropdown(choices=choices, value=None), status, dbg
 
 
@@ -460,13 +604,20 @@ def ui_apply_token_id_to_query(token_id: Optional[int]) -> str:
         return ""
 
 
+def ui_apply_service_doc_to_query(doc_id: Optional[str]) -> str:
+    if not doc_id:
+        return ""
+    for d in CACHE.docs:
+        if d.doc_id == str(doc_id):
+            return (d.bn.strip() or d.en.strip() or "").strip()
+    return ""
+
+
 def ui_stream_search(query: str, search_top_k: int, delay_ms: int, state: Dict[str, Any]):
     q = (query or "").strip()
     if not q:
         yield ("Type to search…", perf_md(state), state)
         return
-
-    # basic guard to reduce thrash
     if len(q) < 2:
         yield ("Type at least 2 characters…", perf_md(state), state)
         return
@@ -491,10 +642,13 @@ CSS = "#results_md { min-height: 420px; }"
 with gr.Blocks(title="Cache-first MyGov Search (Gradio)") as demo:
     perf_state = gr.State(perf_state_init())
 
+    token_enabled = bool(CACHE.vocab) and bool(CACHE.prefix_map)
+
     gr.Markdown(
-        "## MyGov Search (Cache-first Autocomplete + Streaming Search)\n"
-        "- Suggestions come ONLY from `search_service_dump.json` cache\n"
-        "- No submit button; updates on keystrokes"
+        "## MyGov Search (Cache-first)\n"
+        "- Token suggestions: cache prefix_map/vocab/unigram/bigram (rank-only)\n"
+        "- Service suggestions: cache documents.keywords (keyword match)\n"
+        f"- Token autocomplete enabled: **{token_enabled}**\n"
     )
 
     with gr.Row():
@@ -502,12 +656,19 @@ with gr.Blocks(title="Cache-first MyGov Search (Gradio)") as demo:
             query = gr.Textbox(label="Search", placeholder="Type…", lines=1, autofocus=True)
 
             with gr.Row():
-                suggest_top_k = gr.Slider(1, 500, value=DEFAULT_SUGGEST_TOPK, step=1, label="Autocomplete top_k")
+                suggest_top_k = gr.Slider(1, 500, value=DEFAULT_SUGGEST_TOPK, step=1, label="Token autocomplete top_k")
+                service_suggest_top_k = gr.Slider(1, 100, value=DEFAULT_SERVICE_SUGGEST_TOPK, step=1, label="Service suggest top_k")
                 debug_mode = gr.Checkbox(value=False, label="Debug mode")
 
-            suggestions = gr.Dropdown(label="Suggestions (token)", choices=[], value=None, interactive=True)
-            suggestion_status = gr.Markdown(value="Suggestions: 0")
-            debug_out = gr.Markdown(value="")
+            # Token suggestions
+            token_suggestions = gr.Dropdown(label="Token Suggestions (prefix_map)", choices=[], value=None, interactive=True)
+            token_status = gr.Markdown(value="Token Suggestions: 0")
+            token_debug_out = gr.Markdown(value="")
+
+            # Service suggestions
+            service_suggestions = gr.Dropdown(label="Service Suggestions (keyword match)", choices=[], value=None, interactive=True)
+            service_status = gr.Markdown(value="Service Suggestions: 0")
+            service_debug_out = gr.Markdown(value="")
 
             with gr.Row():
                 search_top_k = gr.Slider(3, 25, value=DEFAULT_SEARCH_TOPK, step=1, label="Search Top K")
@@ -522,24 +683,41 @@ with gr.Blocks(title="Cache-first MyGov Search (Gradio)") as demo:
             results_md = gr.Markdown(value="Type to search…", elem_id="results_md")
             perf_panel = gr.Markdown(value="### Performance\nNo measurements yet.")
 
-    # Realtime suggestions on every keystroke (queue=False)
+    # realtime token suggestions
     query.input(
-        fn=ui_update_suggestions,
+        fn=ui_update_token_suggestions,
         inputs=[query, suggest_top_k, debug_mode],
-        outputs=[suggestions, suggestion_status, debug_out],
+        outputs=[token_suggestions, token_status, token_debug_out],
         queue=False,
         trigger_mode="always_last",
     )
 
-    # Apply suggestion -> set query to chosen token
-    suggestions.change(
+    # realtime service suggestions
+    query.input(
+        fn=ui_update_service_suggestions,
+        inputs=[query, service_suggest_top_k, debug_mode],
+        outputs=[service_suggestions, service_status, service_debug_out],
+        queue=False,
+        trigger_mode="always_last",
+    )
+
+    # apply token suggestion -> query
+    token_suggestions.change(
         fn=ui_apply_token_id_to_query,
-        inputs=[suggestions],
+        inputs=[token_suggestions],
         outputs=[query],
         queue=False,
     )
 
-    # Streaming search (change reduces thrash)
+    # apply service suggestion -> query
+    service_suggestions.change(
+        fn=ui_apply_service_doc_to_query,
+        inputs=[service_suggestions],
+        outputs=[query],
+        queue=False,
+    )
+
+    # streaming search
     query.change(
         fn=ui_stream_search,
         inputs=[query, search_top_k, stream_delay_ms, perf_state],
@@ -555,13 +733,16 @@ with gr.Blocks(title="Cache-first MyGov Search (Gradio)") as demo:
         queue=True,
     )
 
-    gr.Markdown(f"**Cache loaded once from:** `{CACHE_PATH}` • **Vocab size:** {len(CACHE.vocab)} • **Docs:** {len(CACHE.docs)}")
+    gr.Markdown(
+        f"**Cache loaded once from:** `{CACHE_PATH}` • "
+        f"**Vocab size:** {len(CACHE.vocab or [])} • **Docs:** {len(CACHE.docs)}"
+    )
 
 
 if __name__ == "__main__":
     demo.queue(max_size=64).launch(
         server_name="0.0.0.0",
-        server_port=7860,
+        server_port=7858,
         show_error=True,
         css=CSS,
     )

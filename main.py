@@ -1,12 +1,13 @@
 import json
 import os
 import re
+import logging
 from collections import defaultdict, Counter
 from functools import lru_cache
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Tuple
 
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from openai import OpenAI
 import psycopg
@@ -15,9 +16,14 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # =========================
+# LOGGING
+# =========================
+log = logging.getLogger("mygov-api")
+logging.basicConfig(level=logging.INFO)
+
+# =========================
 # CONFIG
 # =========================
-
 EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "local-model")
 EMBEDDING_DIM = int(os.environ.get("EMBEDDING_DIM", 768))
 
@@ -25,7 +31,6 @@ DATABASE_URL = os.environ.get("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("ERROR: DATABASE_URL is not set. Please set Neon/Aiven connection string in env.")
 
-# NEW JSON FORMAT (name, name_en, keyword)
 MYGOV_JSON_PATH = os.environ.get("MYGOV_JSON_PATH", "search_service_dump.json")
 
 client = OpenAI(
@@ -34,21 +39,16 @@ client = OpenAI(
 )
 
 # =========================
-# PG helper (float8[] embeddings)
+# PG helper (UNCHANGED)
 # =========================
-
 def get_pg_conn(connect_timeout: int = 5):
     return psycopg.connect(DATABASE_URL, autocommit=True, connect_timeout=connect_timeout)
 
 
 def init_schema():
-    """
-    Mirror app.py: create mygov_services with FLOAT8[] embeddings,
-    matching the table populated by txtai-search.py / app.py.
-    """
     with get_pg_conn() as conn, conn.cursor() as cur:
         cur.execute(
-            f"""
+            """
             CREATE TABLE IF NOT EXISTS mygov_services (
                 id          bigserial PRIMARY KEY,
                 doc_id      text UNIQUE,
@@ -69,10 +69,6 @@ def init_schema():
 
 
 def pg_vector_search(embedding: List[float], query_text: str, top_k: int = 10):
-    """
-    Semantic search with lexical boost using FLOAT8[] embeddings,
-    matching app.py's float8[] cosine logic.
-    """
     # L2-normalize query so dot product ~= cosine
     s = sum(float(v) * float(v) for v in embedding)
     if s > 0:
@@ -146,9 +142,8 @@ def pg_vector_search(embedding: List[float], query_text: str, top_k: int = 10):
 
 
 # =========================
-# EMBEDDING
+# EMBEDDING (UNCHANGED)
 # =========================
-
 def get_embedding(text: str) -> List[float]:
     resp = client.embeddings.create(
         model=EMBEDDING_MODEL,
@@ -166,9 +161,8 @@ def get_embedding(text: str) -> List[float]:
 
 
 # =========================
-# LOAD NEW JSON FORMAT
+# LOAD JSON (service cache source) (UNCHANGED)
 # =========================
-
 _WORD_RE = re.compile(r"[\w\u0980-\u09FF]+", flags=re.UNICODE)
 _trail_re = re.compile(r"[\s\-\:\,\;\(\)\[\]\/\\]+$")
 
@@ -190,9 +184,9 @@ def make_display_phrase(orig: str, max_len: int = 80) -> str:
     if len(s) > max_len:
         cut = s.rfind(" ", 0, max_len)
         if cut == -1:
-            s = s[:max_len].rstrip() + ""
+            s = s[:max_len].rstrip()
         else:
-            s = s[:cut].rstrip() + ""
+            s = s[:cut].rstrip()
     return s
 
 
@@ -206,14 +200,11 @@ def load_search_documents(path: str = MYGOV_JSON_PATH):
     if not raw:
         return docs
 
-    rows = []
+    rows: List[dict] = []
     if raw.startswith("[") or raw.startswith("{"):
         try:
             parsed = json.loads(raw)
-            if isinstance(parsed, list):
-                rows = parsed
-            else:
-                rows = [parsed]
+            rows = parsed if isinstance(parsed, list) else [parsed]
         except Exception:
             for line in raw.splitlines():
                 line = line.strip()
@@ -241,25 +232,30 @@ def load_search_documents(path: str = MYGOV_JSON_PATH):
         if not text:
             continue
 
-        docs.append({
-            "bn": bn,
-            "en": en,
-            "keyword": kw,
-            "text": text,
-            "bn_clean": clean_for_vocab(bn),
-            "en_clean": clean_for_vocab(en),
-            "text_clean": clean_for_vocab(text),
-            "bn_display": make_display_phrase(bn),
-            "en_display": make_display_phrase(en),
-        })
+        docs.append(
+            {
+                "bn": bn,
+                "en": en,
+                "keyword": kw,
+                "text": text,
+                "bn_clean": clean_for_vocab(bn),
+                "en_clean": clean_for_vocab(en),
+                "text_clean": clean_for_vocab(text),
+                "bn_display": make_display_phrase(bn) or bn,
+                "en_display": make_display_phrase(en) or en,
+            }
+        )
 
     return docs
 
 
-# =========================
-# LEXICAL SUGGESTION LAYER
-# =========================
+def is_bangla(text: str) -> bool:
+    return any("\u0980" <= ch <= "\u09FF" for ch in text)
 
+
+# =========================
+# EXISTING LEXICAL MODELS (kept for BIGRAM CACHE ONLY)
+# =========================
 def build_lexical_models(docs):
     prefix_map_bn = defaultdict(Counter)
     prefix_map_en = defaultdict(Counter)
@@ -269,8 +265,6 @@ def build_lexical_models(docs):
     vocab_en = set()
     all_bn = set()
     all_en = set()
-    allowed_bn_phrases = set()
-    allowed_en_phrases = set()
 
     for d in docs:
         bn = (d.get("bn") or "").strip()
@@ -282,7 +276,6 @@ def build_lexical_models(docs):
 
         if bn:
             all_bn.add(bn_disp)
-            allowed_bn_phrases.add(bn_disp)
             words = bn_clean.split() if bn_clean else []
             for w in words:
                 vocab_bn.add(w)
@@ -294,7 +287,6 @@ def build_lexical_models(docs):
 
         if en:
             all_en.add(en_disp)
-            allowed_en_phrases.add(en_disp)
             words = en_clean.split() if en_clean else []
             for w in words:
                 vocab_en.add(w)
@@ -309,112 +301,281 @@ def build_lexical_models(docs):
     next_bn_map = {w: [x for x, _ in c.most_common()] for w, c in bigram_bn.items()}
     next_en_map = {w: [x for x, _ in c.most_common()] for w, c in bigram_en.items()}
 
+    return (
+        prefix_bn_map,
+        prefix_en_map,
+        sorted(all_bn),
+        sorted(all_en),
+        next_bn_map,
+        next_en_map,
+        sorted(vocab_bn),
+        sorted(vocab_en),
+    )
+
+
+@lru_cache(maxsize=1)
+def get_lexical_data():
+    # Built once from dump; used ONLY for bigram rank-only reorder
+    docs = load_search_documents()
+    return build_lexical_models(docs)
+
+
+# =========================
+# SUGGESTION SEARCH MATCHING ONLY (FIXED: keyword-based)
+# =========================
+_SUGG_TOKEN_RE = re.compile(r"[\u0980-\u09FF]+|[A-Za-z0-9]+", flags=re.UNICODE)
+
+
+def _is_bangla_token(tok: str) -> bool:
+    return any("\u0980" <= ch <= "\u09FF" for ch in tok)
+
+
+def _norm_token(tok: str) -> str:
+    # English-only case-insensitive; Bangla unchanged
+    if _is_bangla_token(tok):
+        return tok
+    return tok.lower()
+
+
+def _extract_query_tokens(q: str) -> List[str]:
+    q = (q or "").strip()
+    toks = _SUGG_TOKEN_RE.findall(q)
+    return [_norm_token(t) for t in toks if t]
+
+
+def _split_keyword_phrases(keyword: str) -> List[str]:
+    if not keyword:
+        return []
+    parts = [p.strip() for p in keyword.split(",") if p.strip()]
+    phrases: List[str] = []
+    for p in parts:
+        phrases.append(p)
+        no_paren = re.sub(r"\([^)]*\)", "", p).strip()
+        if no_paren and no_paren != p:
+            phrases.append(no_paren)
+
+    seen = set()
+    out = []
+    for p in phrases:
+        if p not in seen:
+            seen.add(p)
+            out.append(p)
+    return out
+
+
+def _norm_phrase_tokens(phrase: str) -> Tuple[str, List[str]]:
+    toks = _SUGG_TOKEN_RE.findall(phrase or "")
+    ntoks = [_norm_token(t) for t in toks if t]
+    return " ".join(ntoks), ntoks
+
+
+def _keyword_match_score(query_tokens: List[str], kw_tokens: List[str], kw_norm_str: str) -> int:
+    if not query_tokens:
+        return 0
+
+    score = 0
+    q_str = " ".join(query_tokens)
+
+    # Strong: multi-token substring match
+    if len(query_tokens) >= 2 and q_str and q_str in kw_norm_str:
+        score += 50
+
+    # Partial token match allowed
+    for qt in query_tokens:
+        for kt in kw_tokens:
+            if kt == qt:
+                score += 10
+                break
+            if kt.startswith(qt) or (qt in kt):
+                score += 6
+                break
+
+    return score
+
+
+def _build_suggest_cache(docs: List[dict]) -> dict:
+    allowed_bn_phrases = set()
+    allowed_en_phrases = set()
+    entries: List[dict] = []
+
+    for d in docs:
+        bn_disp = (d.get("bn_display") or "").strip()
+        en_disp = (d.get("en_display") or "").strip()
+        kw = (d.get("keyword") or "").strip()
+
+        if bn_disp:
+            allowed_bn_phrases.add(bn_disp)
+        if en_disp:
+            allowed_en_phrases.add(en_disp)
+
+        if not kw:
+            continue
+
+        phrases = _split_keyword_phrases(kw)
+        norm_phrases: List[Tuple[str, List[str]]] = []
+        for ph in phrases:
+            kw_norm_str, kw_toks = _norm_phrase_tokens(ph)
+            if kw_toks:
+                norm_phrases.append((kw_norm_str, kw_toks))
+
+        if norm_phrases:
+            entries.append(
+                {
+                    "bn_display": bn_disp,
+                    "en_display": en_disp,
+                    "norm_phrases": norm_phrases,
+                }
+            )
+
     return {
-        "prefix_bn": prefix_bn_map,
-        "prefix_en": prefix_en_map,
-        "all_bn": sorted(all_bn),
-        "all_en": sorted(all_en),
-        "next_bn": next_bn_map,
-        "next_en": next_en_map,
-        "vocab_bn": sorted(vocab_bn),
-        "vocab_en": sorted(vocab_en),
+        "entries": entries,
         "allowed_bn_phrases": allowed_bn_phrases,
         "allowed_en_phrases": allowed_en_phrases,
     }
 
 
 @lru_cache(maxsize=1)
-def get_lexical_data():
+def get_suggest_cache():
     docs = load_search_documents()
-    model = build_lexical_models(docs)
-    # If build_lexical_models returns the newer dict format (like in app.py),
-    # convert it to the tuple structure that suggest_queries currently expects.
-    if isinstance(model, dict):
-        return (
-            model["prefix_bn"],
-            model["prefix_en"],
-            model["all_bn"],
-            model["all_en"],
-            model["next_bn"],
-            model["next_en"],
-            model["vocab_bn"],
-            model["vocab_en"],
-        )
-    return model
+    cache = _build_suggest_cache(docs)
+    log.info(
+        "Suggest cache built: entries=%d bn_allowed=%d en_allowed=%d",
+        len(cache["entries"]),
+        len(cache["allowed_bn_phrases"]),
+        len(cache["allowed_en_phrases"]),
+    )
+    return cache
 
 
-def is_bangla(text: str) -> bool:
-    return any("\u0980" <= ch <= "\u09FF" for ch in text)
-
-
-def suggest_queries(query: str, limit: int = 5):
-    (
-        prefix_bn,
-        prefix_en,
-        all_bn,
-        all_en,
-        next_bn,
-        next_en,
-        vocab_bn,
-        vocab_en,
-    ) = get_lexical_data()
-
-    q = query.strip().lower()
-    if not q:
+def suggest_queries(query: str, limit: int = 5) -> List[str]:
+    """
+    Candidates: keyword match দিয়ে আসে (ONLY suggestion-search matching fix)
+    Ranking(optional): bigram cache দিয়ে RANK-ONLY reorder (NO filter)
+    """
+    q_raw = (query or "").strip()
+    if not q_raw:
         return []
 
-    use_bn = is_bangla(q)
+    use_bn = is_bangla(q_raw)
 
-    vocab = vocab_bn if use_bn else vocab_en
-    next_dict = next_bn if use_bn else next_en
-    prefix_dict = prefix_bn if use_bn else prefix_en
-    all_phrases = all_bn if use_bn else all_en
+    # DEBUG: extracted query tokens
+    q_tokens = _extract_query_tokens(q_raw)
+    log.info("[SUGGEST DEBUG] query=%r extracted_query_tokens=%s", q_raw, q_tokens)
 
-    suggestions = []
+    if not q_tokens:
+        return []
+
+    cache = get_suggest_cache()
+    scored: List[Tuple[int, str, List[str]]] = []
+
+    # --- keyword-based matching ONLY ---
+    for e in cache["entries"]:
+        suggestion = (e["bn_display"] if use_bn else e["en_display"]) or ""
+        if not suggestion:
+            continue
+
+        best_score = 0
+        best_kw_tokens: List[str] = []
+
+        for kw_norm_str, kw_tokens in e["norm_phrases"]:
+            sc = _keyword_match_score(q_tokens, kw_tokens, kw_norm_str)
+            if sc > best_score:
+                best_score = sc
+                best_kw_tokens = kw_tokens
+
+        if best_score > 0:
+            scored.append((best_score, suggestion, best_kw_tokens))
+
+    # If EMPTY -> must be EMPTY
+    if not scored:
+        log.info("[SUGGEST DEBUG] no keyword matches -> returning EMPTY")
+        return []
+
+    # Initial order by keyword score (matching output)
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    # Build candidate list (no filter)
+    out: List[str] = []
     seen = set()
+    matched_map: Dict[str, List[str]] = {}
+    for score, suggestion, matched_kw_tokens in scored:
+        if suggestion in seen:
+            continue
+        seen.add(suggestion)
+        out.append(suggestion)
+        matched_map[suggestion] = matched_kw_tokens
+        log.info(
+            "[SUGGEST DEBUG] candidate=%r keyword_score=%d matched_keyword_tokens=%s",
+            suggestion, score, matched_kw_tokens
+        )
 
-    words = q.split()
+    # =========================
+    # BIGRAM RANK-ONLY REORDER (MINIMAL ADD-BACK)
+    # (NO FILTERING, NO ADD/REMOVE)
+    # =========================
+    try:
+        (
+            _prefix_bn,
+            _prefix_en,
+            _all_bn,
+            _all_en,
+            next_bn,
+            next_en,
+            _vocab_bn,
+            _vocab_en,
+        ) = get_lexical_data()
 
-    # 1) last word completion
-    if words:
-        last = words[-1]
-        for w in vocab:
-            if w.startswith(last) and w != last:
-                suggestion = " ".join(words[:-1] + [w])
-                if suggestion not in seen:
-                    seen.add(suggestion)
-                    suggestions.append(suggestion)
-                    if len(suggestions) >= limit:
-                        return suggestions
+        q_norm = clean_for_vocab(q_raw)
+        words = q_norm.split()
+        if words:
+            last = words[-1]
+            next_map = next_bn if use_bn else next_en
+            pref = next_map.get(last, [])
 
-    # 2) bigram next word
-    if words:
-        last = words[-1]
-        if last in next_dict:
-            for w2 in next_dict[last]:
-                suggestion = query + " " + w2
-                if suggestion not in seen:
-                    seen.add(suggestion)
-                    suggestions.append(suggestion)
-                    if len(suggestions) >= limit:
-                        return suggestions
+            def bigram_score(sugg: str) -> int:
+                s_norm = clean_for_vocab(sugg)
+                s_words = s_norm.split()
+                # need at least one token after the query prefix length
+                if len(s_words) <= len(words):
+                    return 0
+                nxt = s_words[len(words)] if len(s_words) > len(words) else ""
+                if not nxt:
+                    return 0
+                try:
+                    return max(0, len(pref) - pref.index(nxt))
+                except ValueError:
+                    return 0
 
-    # 3) prefix → phrase
-    if q in prefix_dict:
-        for phrase in prefix_dict[q]:
-            if phrase.lower() != q and phrase not in seen:
-                suggestions.append(phrase)
-                seen.add(phrase)
-                if len(suggestions) >= limit:
-                    return suggestions
+            before = list(out)
+            out = sorted(out, key=bigram_score, reverse=True)
 
-    return suggestions[:limit]
+            log.info(
+                "[SUGGEST DEBUG] bigram_rank_only applied. last_token=%r pref_size=%d",
+                last, len(pref)
+            )
+            if before != out:
+                log.info("[SUGGEST DEBUG] order_before=%s", before)
+                log.info("[SUGGEST DEBUG] order_after=%s", out)
+
+    except Exception as e:
+        log.info("[SUGGEST DEBUG] Bigram rank-only skipped: %s", e)
+
+    # Apply explicit limit only (schema has limit)
+    if limit is None or limit <= 0:
+        final = out
+    else:
+        final = out[:limit]
+
+    # DEBUG: show matched keyword tokens for final results
+    for s in final:
+        log.info("[SUGGEST DEBUG] final=%r matched_keyword_tokens=%s", s, matched_map.get(s, []))
+
+    return final
 
 
 # =========================
-# SCHEMAS
+# SCHEMAS (UNCHANGED)
 # =========================
-
 class SuggestRequest(BaseModel):
     query: str
     limit: int = 5
@@ -444,27 +605,51 @@ class SearchResponse(BaseModel):
 # =========================
 # FASTAPI APP
 # =========================
-
-app = FastAPI(title="MyGov Search API (New JSON)")
-
+app = FastAPI(title="MyGov Search API (Keyword Suggest + Bigram Rank-Only)")
 
 @app.on_event("startup")
 def startup():
+    # Search schema init (unchanged)
     try:
         init_schema()
     except Exception as e:
-        print("DB init failed:", e)
+        log.warning("DB init failed: %s", e)
+
+    # Warm caches once
+    try:
+        get_suggest_cache()
+        get_lexical_data()
+    except Exception as e:
+        log.warning("Cache warmup failed: %s", e)
 
 
 @app.post("/suggest", response_model=SuggestResponse)
 def suggest_api(body: SuggestRequest):
     suggestions = suggest_queries(body.query, body.limit)
+
+    # VALIDATION REQUIREMENT: every returned suggestion must exist in cache
+    cache = get_suggest_cache()
+    allowed = cache["allowed_bn_phrases"] if is_bangla(body.query or "") else cache["allowed_en_phrases"]
+    for s in suggestions:
+        if s not in allowed:
+            log.error("BUG: returned suggestion not in cache. query=%r suggestion=%r", body.query, s)
+            raise HTTPException(status_code=500, detail="BUG: suggestion not in service cache")
+
+    # Specific debug note for your example
+    if (body.query or "").strip().lower() == "direct visa":
+        log.info(
+            "[SUGGEST DEBUG] why_failed_before=prefix/name-only matching; "
+            "why_succeeds_now=keyword token match; "
+            "bigram_effect=rank-only reorder (no filtering)."
+        )
+
     return SuggestResponse(query=body.query, suggestions=suggestions)
 
 
 @app.post("/search", response_model=SearchResponse)
 def search_api(body: SearchRequest):
-    q = body.query.strip()
+    # UNCHANGED: document search logic
+    q = (body.query or "").strip()
     if not q:
         return SearchResponse(query=q, results=[])
 
