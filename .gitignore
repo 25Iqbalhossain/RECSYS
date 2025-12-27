@@ -3,10 +3,6 @@ __pycache__/
 *.pyc
 .env
 
-data/
-*.parquet
-*.csv
-*.jsonl
 
 .vscode/
 .idea/
@@ -15,19 +11,5 @@ data/
 .env
 
 
-# ignore big buckets / generated data
-data/artifacts/**
-data/raw_events/**
-data/sessions/**
-*.parquet
-*.csv
-*.jsonl
-
-# allow small demo samples
-!data/samples/**
-
-.vscode/
-.idea/
-.venv
-
-embeddings/models.py
+/data/faiss_index.bin
+/data/mysql_content_metadata.jsonl
