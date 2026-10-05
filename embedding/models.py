@@ -1,56 +1,74 @@
-# embeddings/models.py
-from __future__ import annotations
-import numpy as np
-#import hashlib
+"""Embedding helpers used across the recommendation system.
 
-DIM = 64  # keep small for demo
+All embedding calls are funneled through the Hugging Face Inference
+client defined in ``data.testconfig``. That module also exposes a
+deterministic local fallback (hash‑based) so that semantic functionality
+still works in offline environments where a remote HF endpoint is not
+available.
+
+Key conventions
+----------------
+* ``DIM`` is the global embedding dimension (``EMBEDDING_DIM``).
+* Both free‑text and item‑ID embeddings live in the same vector space,
+  so cosine similarity between them is meaningful.
+* Higher cosine similarity means “more semantically similar” and is
+  what the FAISS index stores and returns.
 """
-def _hash_to_vec(text: str, dim: int = DIM) -> np.ndarray:
-    h = hashlib.sha256(text.encode("utf-8")).digest()
-    # repeat the 32-byte hash to fill dim
-    arr = np.frombuffer((h * ((dim // 32) + 1))[:dim], dtype=np.uint8).astype(np.float32)
-    v = arr - arr.mean()
-    n = np.linalg.norm(v) + 1e-9
-    return v / n
+
+from __future__ import annotations
+
+import numpy as np
+
+from data.testconfig import EMBEDDING_DIM, hf_embed_one
+
+# Public constant: embedding vector dimension used by FAISS and models.
+DIM = EMBEDDING_DIM
+
 
 def embed_text(text: str) -> np.ndarray:
+    """
+    Embed an arbitrary text string into the shared semantic vector space.
 
-    return _hash_to_vec(text, DIM)
+    This is the primary entry point for semantic search queries, titles,
+    and descriptions. It delegates to the HF Inference client (or the
+    deterministic fallback) and always returns a 1‑D NumPy array of
+    length ``DIM``.
+
+    Parameters
+    ----------
+    text : str
+        Input text such as a user query, item title, or description.
+
+    Returns
+    -------
+    np.ndarray
+        1‑D embedding vector with shape ``[DIM]`` and dtype float32.
+    """
+    return hf_embed_one(text)
+
 
 def embed_item_id(item_id: str) -> np.ndarray:
-   
-    return _hash_to_vec(f"ITEM::{item_id}", DIM)
-"""
-from sentence_transformers import SentenceTransformer
+    """
+    Embed an item identifier into the same semantic vector space.
 
+    The implementation prefixes the ID with ``"ITEM::"`` before
+    encoding. This gives each item a *stable* pseudo‑embedding:
 
-try:
-    model = SentenceTransformer('all-MiniLM-L6-v2')
-    
-    DIM = model.get_sentence_embedding_dimension() 
-except Exception as e:
-    print(f"Error loading SentenceTransformer model: {e}")
-    print("Please run 'pip install sentence-transformers'")
-    model = None
-    DIM = 0 
+    * The same ``item_id`` will always produce the same vector (given
+      fixed model weights).
+    * Different IDs map to different regions of the space, allowing us
+      to compare item‑to‑item similarity via cosine distance.
 
-def _hash_to_vec(text: str, dim: int = DIM) -> np.ndarray | None:
-   
-    if model is None:
-        print("Model is not loaded. Cannot create embedding.")
-        return None
+    Parameters
+    ----------
+    item_id : str
+        Application‑level item identifier (for example ``"123"`` or
+        ``"movie_42"``).
 
-    embedding = model.encode(text)
-    return embedding
-
-def embed_text(text: str) -> np.ndarray | None:
-    """Deterministic embedding for demo (no heavy model)."""
-  
-    return _hash_to_vec(text, DIM)
-
-def embed_item_id(item_id: str) -> np.ndarray | None:
-    """If you only have item IDs, this gives a stable pseudo-embedding."""
-   
-    return _hash_to_vec(f"ITEM::{item_id}", DIM)
-
+    Returns
+    -------
+    np.ndarray
+        1‑D embedding vector with shape ``[DIM]`` and dtype float32.
+    """
+    return hf_embed_one(f"ITEM::{item_id}")
 
